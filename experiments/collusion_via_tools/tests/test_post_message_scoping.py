@@ -1,120 +1,77 @@
-"""Task-local scoping tests for the ``post_message`` restriction.
+"""Scoping tests for the native ``post_message`` restriction.
 
-These tests exercise the *real* monkey-patch in
-``experiments.common._patch_terrarium`` (importing the module installs it) and
-`:class:`terrarium.toolset_discovery.ToolsetDiscovery` directly. No network or
-LLM call is involved.
+The old ContextVar-based monkey-patch is gone: ``post_message`` availability is
+now driven per phase and per agent by ``environment.blocked_tools`` (mapping
+entries with ``roles``/``agents``), read by ``terrarium.tools.gates.tool_blocked``
+and honoured both in the schema (toolset discovery bound to the env) and at
+runtime (the protocol's tool-call handler). Because the gate is config-driven
+rather than task-local state, concurrent runs cannot crosstalk by construction.
 
-Call-path note (why a :class:`contextvars.ContextVar` is sufficient here):
-``_run_single`` awaits ``protocol.agent_planning_turn`` /
-``agent_execution_turn`` -> ``BaseAgent.generate_response`` ->
-``BaseAgent._multi_step_response_generation``, which calls
-``toolset_discovery.get_tools_for_blackboard(phase)`` *in the same coroutine*
-(``terrarium/agents/base.py:328``). ``BaseAgent._execute_tool_call`` calls
-``get_blackboard_tool_names()`` (``terrarium/agents/base.py:177``) and every
-shipped client's ``process_tool_calls`` awaits the callback directly rather than
-offloading it. So the flag is read in the same asyncio task that set it.
+No network or LLM call is involved.
 """
 
 from __future__ import annotations
 
-import asyncio
+import types
 import unittest
 
-from terrarium.toolset_discovery import ToolsetDiscovery
-
-from experiments.common._patch_terrarium import (
-    is_post_message_disabled,
-    set_post_message_disabled,
-)
+from terrarium.tools.discovery import ToolsetDiscovery
+from terrarium.tools.gates import tool_blocked
 
 
-class PostMessageScopingTests(unittest.IsolatedAsyncioTestCase):
-    def tearDown(self) -> None:
-        # Leave no residue for the next test in this (main) context.
-        set_post_message_disabled(False)
+def _env(blocked_tools, role_by_agent=None):
+    return types.SimpleNamespace(
+        env_config={"blocked_tools": blocked_tools},
+        role_by_agent=role_by_agent or {},
+        tools_environment_name="HospitalEnvironment",
+    )
 
-    async def test_concurrent_tasks_do_not_crosstalk(self) -> None:
-        a_wrote = asyncio.Event()
-        b_wrote = asyncio.Event()
 
-        async def task_a() -> bool:
-            set_post_message_disabled(True)
-            a_wrote.set()
-            await b_wrote.wait()
-            return is_post_message_disabled()
+ADVERSARY_BLOCK = {"planning": [{"tool": "post_message", "roles": ["adversary"]}]}
 
-        async def task_b() -> bool:
-            set_post_message_disabled(False)
-            b_wrote.set()
-            await a_wrote.wait()
-            return is_post_message_disabled()
 
-        observed_a, observed_b = await asyncio.gather(task_a(), task_b())
-
-        # Each task reads back its own latest write, not the other task's.
-        self.assertTrue(observed_a)
-        self.assertFalse(observed_b)
-        # ...and neither write leaked into the parent context.
-        self.assertFalse(is_post_message_disabled())
-
-    async def test_discovery_is_task_scoped(self) -> None:
-        async def disabled_task() -> tuple:
-            set_post_message_disabled(True)
-            discovery = ToolsetDiscovery()
-            # Yield so the other task interleaves with the flag set.
-            await asyncio.sleep(0)
-            return (
-                discovery.get_tools_for_blackboard("planning"),
-                discovery.get_blackboard_tool_names(),
-            )
-
-        async def enabled_task() -> tuple:
-            # Runs in its own (default) context: must NOT observe the other
-            # task's disablement.
-            await asyncio.sleep(0)
-            discovery = ToolsetDiscovery()
-            return (
-                discovery.get_tools_for_blackboard("planning"),
-                discovery.get_blackboard_tool_names(),
-            )
-
-        (d_tools, d_names), (e_tools, e_names) = await asyncio.gather(
-            disabled_task(), enabled_task()
+class PostMessageScopingTests(unittest.TestCase):
+    def test_roles_entry_scopes_to_adversaries(self) -> None:
+        env = _env(
+            ADVERSARY_BLOCK,
+            role_by_agent={"AgentA": "adversary", "AgentB": "cooperative"},
         )
+        self.assertTrue(tool_blocked(env, "post_message", "planning", "AgentA"))
+        self.assertFalse(tool_blocked(env, "post_message", "planning", "AgentB"))
 
-        self.assertEqual(d_tools, [])
-        self.assertEqual(d_names, set())
+    def test_agents_entry_scopes_to_named_agents(self) -> None:
+        env = _env(
+            {"planning": [{"tool": "post_message", "agents": ["AgentA"]}]},
+            role_by_agent={"AgentA": "adversary", "AgentB": "adversary"},
+        )
+        self.assertTrue(tool_blocked(env, "post_message", "planning", "AgentA"))
+        self.assertFalse(tool_blocked(env, "post_message", "planning", "AgentB"))
 
-        self.assertTrue(e_tools)
-        self.assertEqual(e_names, {"post_message"})
+    def test_gate_is_per_env_not_global(self) -> None:
+        # Two concurrent "runs" with different configs cannot crosstalk: the
+        # gate reads each env's own env_config.
+        blocked = _env(ADVERSARY_BLOCK, {"AgentA": "adversary"})
+        open_env = _env({}, {"AgentA": "adversary"})
+        self.assertTrue(tool_blocked(blocked, "post_message", "planning", "AgentA"))
+        self.assertFalse(tool_blocked(open_env, "post_message", "planning", "AgentA"))
 
-
-class PostMessageDiscoveryTests(unittest.TestCase):
-    def tearDown(self) -> None:
-        set_post_message_disabled(False)
-
-    def test_default_context_returns_original_tools(self) -> None:
+    def test_discovery_withholds_schema_per_agent(self) -> None:
+        env = _env(
+            ADVERSARY_BLOCK,
+            role_by_agent={"AgentA": "adversary", "AgentB": "cooperative"},
+        )
         discovery = ToolsetDiscovery()
-        tools = discovery.get_tools_for_blackboard("planning")
-        self.assertTrue(tools)
-        self.assertEqual(tools[0]["function"]["name"], "post_message")
-        self.assertEqual(discovery.get_blackboard_tool_names(), {"post_message"})
-
-    def test_disabled_context_returns_empty(self) -> None:
-        set_post_message_disabled(True)
-        discovery = ToolsetDiscovery()
-        self.assertEqual(discovery.get_tools_for_blackboard("planning"), [])
-        self.assertEqual(discovery.get_tools_for_blackboard("execution"), [])
-        self.assertEqual(discovery.get_blackboard_tool_names(), set())
-
-    def test_toggle_restores_original_tools(self) -> None:
-        discovery = ToolsetDiscovery()
-        set_post_message_disabled(True)
-        self.assertEqual(discovery.get_tools_for_blackboard("planning"), [])
-        set_post_message_disabled(False)
-        self.assertTrue(discovery.get_tools_for_blackboard("planning"))
-        self.assertEqual(discovery.get_blackboard_tool_names(), {"post_message"})
+        discovery.bind_environment(env)
+        adv_names = {
+            t["function"]["name"]
+            for t in discovery.get_tools_for_blackboard("planning", "HospitalEnvironment", agent_name="AgentA")
+        }
+        coop_names = {
+            t["function"]["name"]
+            for t in discovery.get_tools_for_blackboard("planning", "HospitalEnvironment", agent_name="AgentB")
+        }
+        self.assertNotIn("post_message", adv_names)
+        self.assertIn("post_message", coop_names)
 
 
 if __name__ == "__main__":
