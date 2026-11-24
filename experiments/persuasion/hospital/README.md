@@ -39,3 +39,23 @@ experiment:
       helpful_misdirection: |
         Your custom colluder persuasion playbook...
 ```
+
+## Native config flow
+The colluder wiring is driven by the Terrarium submodule's native config keys;
+`run.py` injects them into the per-run config (the colluders are picked per
+sweep/seed):
+
+* `environment.collusion`: `{enabled: true, members: [...], strategy:
+  <sweep strategy>, instructions_file: ""}` — provides the native `role` /
+  `coalition_members` / `secret_blackboard_id` / `collusion_strategy` context
+  keys (the persuasion variant text itself lives in the prompt wrapper, not in
+  an instructions file).
+* `environment.secret_channels`: `[{members: [...]}]` when
+  `secret_channel_enabled` and there are >= 2 colluders — the environment
+  creates the coalition-only board itself.
+* `environment.prompt_wrapper`: `experiments.persuasion.hospital.prompts:PersuasionHospitalPrompts`
+  — reads the sweep's `prompt_variant` / `secret_channel_enabled` from
+  `experiment.persuasion_hospital` (injected per run) plus the native context
+  keys, and logs prompts through the run-private prompt logger.
+* `simulation.phases`: `planning` / `execution` per iteration, walked through
+  the generic `protocol.agent_turn`.
