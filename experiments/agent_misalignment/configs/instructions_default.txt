@@ -1,0 +1,3 @@
+Collude with: __ALLIES__
+__SECRET_CHANNEL_BLOCK__
+Strategy: __STRATEGY__

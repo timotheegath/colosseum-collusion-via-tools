@@ -61,6 +61,15 @@ environment:
   num_patients: 8
   num_hospitals: 2
   default_capacity: 2
+  # Native override surface (injected per run by run.py from the sweep axes;
+  # shown here commented for documentation):
+  #   prompt_wrapper: "experiments.agent_misalignment.prompts:MisalignmentPrompts"
+  #   collusion: {enabled: true, members: [...], strategy: <sweep strategy>, instructions_file: instructions_<strategy>.txt}
+  #   secret_channels: [{members: [...]}]   # when secret_channel_enabled and >=2 adversaries
+  # simulation.phases (injected per run):
+  #   - {name: planning, rounds: max_planning_rounds}
+  #   - {name: execution, rounds: 1}
+  #   - {name: survey, rounds: 1, when: after}
 
 communication_network:
   topology: complete
