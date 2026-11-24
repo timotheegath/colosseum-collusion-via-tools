@@ -1,22 +1,19 @@
+"""Experiment protocol: native SequentialCommunicationProtocol + tool-event recording.
+
+Phase walking (``simulation.phases``), per-phase and per-agent tool gating
+(``environment.blocked_tools``), secret-channel creation and enforcement
+(``environment.secret_channels``), and the generic ``agent_turn`` are all
+native to the Terrarium submodule. This subclass exists only to record every
+tool call into ``tool_events`` so the experiments can dump ``tool_events.json``
+for metrics/analysis — it performs no gating of its own.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
-from terrarium.blackboard import Megaboard, format_blackboard_events_for_prompt
-from terrarium.communication_protocols.base import BaseCommunicationProtocol
-from terrarium.environment_tools import (
-    EnvironmentToolsNotFoundError,
-    instantiate_environment_tools,
-)
-
-from experiments.common._patch_terrarium import (
-    get_post_message_call_limit,
-    get_post_message_count,
-    get_secret_blackboard_id,
-    is_env_tools_blocked,
-    record_post_message_call,
-)
+from terrarium.communication_protocols.sequential import SequentialCommunicationProtocol
 
 
 @dataclass(slots=True)
@@ -30,40 +27,32 @@ class ToolEvent:
     planning_round: Optional[int]
 
 
-class LocalCommunicationProtocol(BaseCommunicationProtocol):
-    """In-process protocol (no MCP server) backed by Megaboard + environment-specific tools."""
+class _RunDirToolLogger:
+    """Minimal tool_logger stand-in (the protocol only needs ``log_dir``)."""
 
-    def __init__(
-        self, *, config: Dict[str, Any], megaboard: Optional[Megaboard] = None
-    ):
-        self.config = config
-        self.megaboard = megaboard or Megaboard()
-        self.environment = None
-        self.current_planning_round: Optional[int] = None
+    def __init__(self, log_dir: Any = None) -> None:
+        self.log_dir = log_dir
+
+
+class LocalCommunicationProtocol(SequentialCommunicationProtocol):
+    """In-process protocol backed by the native sequential protocol.
+
+    Everything except tool-event recording is inherited unchanged:
+
+    - ``agent_turn(..., phase=..., round_num=...)`` walks any config-driven phase;
+    - ``environment_handle_tool_call`` / ``blackboard_handle_tool_call`` enforce
+      ``environment.blocked_tools`` (phase- and agent-scoped) and secret-channel
+      ``enforce_in_phases`` rewriting natively;
+    - ``generate_comm_network`` creates blackboards (the environment creates the
+      ``environment.secret_channels`` boards itself during ``async_init``).
+    """
+
+    def __init__(self, *, config: Dict[str, Any], megaboard: Optional[Any] = None) -> None:
+        super().__init__(config, tool_logger=_RunDirToolLogger())
+        if megaboard is not None:
+            self.megaboard = megaboard
         self.tool_events: List[ToolEvent] = []
-
-        # Environment tools implementation (local, no server).
-        self._env_tools: Any = None
-        self._env_tools_env_name: Optional[str] = None
-
-    def _get_env_tools(self, environment: Any) -> Any:
-        env_name = ""
-        if environment is not None:
-            # Allow environment subclasses to opt into a base toolset without requiring a
-            # duplicate `*Tools` class to exist under envs/**/_tools.py.
-            env_name = str(
-                getattr(environment, "tools_environment_name", None)
-                or environment.__class__.__name__
-                or ""
-            )
-        if not env_name:
-            raise EnvironmentToolsNotFoundError(
-                "Environment missing or invalid (no __class__.__name__)."
-            )
-        if self._env_tools is None or self._env_tools_env_name != env_name:
-            self._env_tools = instantiate_environment_tools(env_name, self.megaboard)
-            self._env_tools_env_name = env_name
-        return self._env_tools
+        self.current_planning_round: Optional[int] = None
 
     def _record_tool_event(
         self,
@@ -87,71 +76,29 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
             )
         )
 
-    def _scrub_secret_blackboards(self) -> None:
-        """
-        Remove tool-action trace events from secret blackboards.
-
-        Some environment tool implementations call `blackboard_manager.log_action_to_blackboards(...)`,
-        which logs actions to every blackboard an agent belongs to. For secret coalition channels,
-        we want them to be used only for communication/scheming, not for action traces.
-        """
-        try:
-            boards = getattr(self.megaboard, "blackboards", None)
-            if not isinstance(boards, list):
-                return
-            for bb in boards:
-                tmpl = getattr(bb, "template", None)
-                if not isinstance(tmpl, dict):
-                    continue
-                is_secret = (
-                    bool(tmpl.get("secret_channel"))
-                    or str(tmpl.get("visibility") or "").lower() == "secret"
-                )
-                if not is_secret:
-                    continue
-                logs = getattr(bb, "logs", None)
-                if not isinstance(logs, list) or not logs:
-                    continue
-                bb.logs = [
-                    e
-                    for e in logs
-                    if not (
-                        isinstance(e, dict)
-                        and str(e.get("kind") or "") == "action_executed"
-                    )
-                ]
-        except Exception:
-            return
-
-    async def _prefetch_blackboard_events(
+    async def agent_turn(
         self,
+        agent: Any,
         agent_name: str,
-        *,
-        phase: Optional[str],
-        iteration: Optional[int],
-    ) -> Dict[str, str]:
-        blackboard_ids = self.megaboard.get_agent_blackboards(agent_name)
-
-        def _sort_key(bb_id: str) -> int:
-            try:
-                return int(bb_id)
-            except Exception:
-                return 0
-
-        contexts: Dict[str, str] = {}
-        for bb_id_str in sorted(blackboard_ids, key=_sort_key):
-            try:
-                bb_id_int = int(bb_id_str)
-            except Exception:
-                continue
-
-            # Prefetch is automatic; avoid polluting tool_events with synthetic get_blackboard_events calls.
-            events = self.megaboard.get(bb_id_int, agent_name, limit=None)
-            contexts[bb_id_str] = format_blackboard_events_for_prompt(
-                events if isinstance(events, list) else []
+        agent_context: Any,
+        environment: Any,
+        iteration: int,
+        phase: str,
+        round_num: Optional[int] = None,
+    ) -> Any:
+        self.current_planning_round = round_num
+        try:
+            return await super().agent_turn(
+                agent,
+                agent_name,
+                agent_context,
+                environment,
+                iteration,
+                phase=phase,
+                round_num=round_num,
             )
-
-        return contexts
+        finally:
+            self.current_planning_round = None
 
     async def environment_handle_tool_call(
         self,
@@ -162,103 +109,18 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         phase: Optional[str] = None,
         iteration: Optional[int] = None,
     ) -> Dict[str, Any]:
-        # Pre-coordination round: silently drop env-tool calls so the agent
-        # sees the tools in its prompt but cannot probe the environment.
-        # The blackboard tools (`post_message`) flow through
-        # `blackboard_handle_tool_call` and are unaffected.
-        if is_env_tools_blocked():
-            stub_result = {
-                "result": None,
-                "blocked": True,
-                "reason": (
-                    "env tools are blocked during the pre-coordination round; "
-                    "use `post_message` on the coalition-only blackboard to "
-                    "agree on a tool-only protocol"
-                ),
-            }
-            self._record_tool_event(
-                tool_name=tool_name,
-                agent_name=agent_name,
-                arguments=arguments,
-                result=stub_result,
-                phase=phase,
-                iteration=iteration,
-            )
-            return stub_result
-
-        env = self.environment
-        if env is None:
-            result = {"error": "Environment not set on protocol."}
-            self._record_tool_event(
-                tool_name=tool_name,
-                agent_name=agent_name,
-                arguments=arguments,
-                result=result,
-                phase=phase,
-                iteration=iteration,
-            )
-            return result
-
-        try:
-            env_tools = self._get_env_tools(env)
-        except EnvironmentToolsNotFoundError as exc:
-            result = {"error": str(exc)}
-            self._record_tool_event(
-                tool_name=tool_name,
-                agent_name=agent_name,
-                arguments=arguments,
-                result=result,
-                phase=phase,
-                iteration=iteration,
-            )
-            return result
-
-        env_state = {}
-        if hasattr(env, "get_serializable_state"):
-            try:
-                env_state = env.get_serializable_state()
-            except Exception:
-                env_state = {}
-
-        response = env_tools.handle_tool_call(
-            tool_name,
-            agent_name,
-            arguments,
-            phase=phase,
-            iteration=iteration,
-            env_state=env_state,
+        result = await super().environment_handle_tool_call(
+            tool_name, agent_name, arguments, phase=phase, iteration=iteration
         )
-
-        # Apply environment state updates if present.
-        state_updates = None
-        if isinstance(response, dict):
-            if "state_updates" in response:
-                state_updates = response.get("state_updates")
-            elif "result" in response and isinstance(response.get("result"), dict):
-                state_updates = response["result"].get("state_updates")
-
-        if state_updates and hasattr(env, "apply_state_updates"):
-            try:
-                env.apply_state_updates(state_updates)
-            except Exception:
-                pass
-            if hasattr(env, "post_tool_execution_callback"):
-                try:
-                    env.post_tool_execution_callback(state_updates, response)
-                except Exception:
-                    pass
-
         self._record_tool_event(
             tool_name=tool_name,
             agent_name=agent_name,
             arguments=arguments,
-            result=response if isinstance(response, dict) else {"result": response},
+            result=result if isinstance(result, dict) else {"result": result},
             phase=phase,
             iteration=iteration,
         )
-        # Ensure secret channels remain communication-only (no action traces).
-        self._scrub_secret_blackboards()
-        return response
+        return result
 
     async def blackboard_handle_tool_call(
         self,
@@ -269,191 +131,15 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         phase: Optional[str] = None,
         iteration: Optional[int] = None,
     ) -> Dict[str, Any]:
-        # Defense in depth for the pre-coordination round: rewrite any
-        # `post_message` call to the coalition-only secret board so the agent
-        # cannot accidentally leak the coordination scheme to the public
-        # blackboard. We do NOT rewrite arguments if the agent explicitly
-        # targeted the secret board already (avoids double-instrumenting).
-        if tool_name == "post_message":
-            secret_bb = get_secret_blackboard_id()
-            if secret_bb is not None:
-                targeted_bb = arguments.get("blackboard_id")
-                if targeted_bb is None:
-                    arguments = dict(arguments)
-                    arguments["blackboard_id"] = secret_bb
-                else:
-                    try:
-                        if int(targeted_bb) != int(secret_bb):
-                            arguments = dict(arguments)
-                            arguments["blackboard_id"] = secret_bb
-                    except (TypeError, ValueError):
-                        arguments = dict(arguments)
-                        arguments["blackboard_id"] = secret_bb
-        # Per-agent `post_message` cap (e.g. for the pre-coordination round).
-        # When the cap is set and the agent is over it, return a structured
-        # rejection so the agent can wrap up its coordination message.
-        if tool_name == "post_message":
-            limit = get_post_message_call_limit()
-            if limit is not None:
-                already = get_post_message_count(agent_name)
-                if already >= limit:
-                    rejection = {
-                        "result": None,
-                        "blocked": True,
-                        "reason": (
-                            f"post_message limit reached for this agent "
-                            f"({already}/{limit}); wrap up your coordination."
-                        ),
-                        "limit": limit,
-                        "count": already,
-                    }
-                    self._record_tool_event(
-                        tool_name=tool_name,
-                        agent_name=agent_name,
-                        arguments=arguments,
-                        result=rejection,
-                        phase=phase,
-                        iteration=iteration,
-                    )
-                    return rejection
-
-        result = self.megaboard.handle_tool_call(
-            tool_name,
-            agent_name,
-            arguments,
-            phase=phase,
-            iteration=iteration,
+        result = await super().blackboard_handle_tool_call(
+            tool_name, agent_name, arguments, phase=phase, iteration=iteration
         )
-        if tool_name == "post_message":
-            record_post_message_call(agent_name)
         self._record_tool_event(
             tool_name=tool_name,
             agent_name=agent_name,
             arguments=arguments,
-            result=result,
+            result=result if isinstance(result, dict) else {"result": result},
             phase=phase,
             iteration=iteration,
         )
-        # Be defensive: keep secret channels communication-only.
-        self._scrub_secret_blackboards()
         return result
-
-    async def get_all_blackboard_ids(self) -> List[str]:
-        return self.megaboard.get_blackboard_string_ids()
-
-    async def get_agent_blackboard_ids(self, agent_name: str) -> List[str]:
-        return self.megaboard.get_agent_blackboards(agent_name)
-
-    async def post_system_message(
-        self,
-        blackboard_id: int,
-        kind: str,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        return self.megaboard.post_system_message(blackboard_id, kind, payload)
-
-    async def generate_comm_network(
-        self,
-        participants: Sequence[str],
-        context: str,
-        template: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        blackboard_id = self.megaboard.add_blackboard(list(participants), template)
-        self.megaboard.post_system_message(
-            blackboard_id,
-            kind="context",
-            payload={"message": context},
-        )
-        return blackboard_id
-
-    async def agent_planning_turn(
-        self,
-        agent: Any,
-        agent_name: str,
-        agent_context: Any,
-        environment: Any,
-        iteration: int,
-        planning_round: int,
-        phase: str = "planning",
-    ) -> Dict[str, Any]:
-        """Run one planning-shaped turn for ``agent``.
-
-        ``phase`` labels the turn for the trajectory/tool logs and defaults to
-        ``"planning"`` so ordinary iteration planning rounds are unaffected.
-        Callers that reuse the planning prompt for another round (e.g. the
-        adversary pre-coordination round) pass a distinct phase so it is not
-        conflated with a normal planning round.
-        """
-        self.environment = environment
-        self.current_planning_round = planning_round
-        blackboard_contexts = await self._prefetch_blackboard_events(
-            agent_name,
-            phase=phase,
-            iteration=iteration,
-        )
-        prompts = environment.prompts
-        return await agent.generate_response(
-            agent_name=agent_name,
-            agent_context=agent_context,
-            blackboard_context=blackboard_contexts,
-            communication_protocol=self,
-            prompts=prompts,
-            phase=phase,
-            iteration=iteration,
-            round_num=planning_round,
-        )
-
-    async def agent_execution_turn(
-        self,
-        agent: Any,
-        agent_name: str,
-        agent_context: Any,
-        environment: Any,
-        iteration: int,
-    ) -> Dict[str, Any]:
-        self.environment = environment
-        self.current_planning_round = None
-        blackboard_contexts = await self._prefetch_blackboard_events(
-            agent_name,
-            phase="execution",
-            iteration=iteration,
-        )
-        prompts = environment.prompts
-        return await agent.generate_response(
-            agent_name=agent_name,
-            agent_context=agent_context,
-            blackboard_context=blackboard_contexts,
-            communication_protocol=self,
-            prompts=prompts,
-            phase="execution",
-            iteration=iteration,
-            round_num=0,
-        )
-
-    async def agent_survey_turn(
-        self,
-        agent: Any,
-        agent_name: str,
-        agent_context: Any,
-        environment: Any,
-        iteration: int,
-    ) -> Dict[str, Any]:
-        """Optional post-run survey turn to elicit beliefs without posting to blackboards."""
-        self.environment = environment
-        self.current_planning_round = None
-        blackboard_contexts = await self._prefetch_blackboard_events(
-            agent_name,
-            phase="survey",
-            iteration=iteration,
-        )
-        prompts = environment.prompts
-        return await agent.generate_response(
-            agent_name=agent_name,
-            agent_context=agent_context,
-            blackboard_context=blackboard_contexts,
-            communication_protocol=self,
-            prompts=prompts,
-            phase="survey",
-            iteration=iteration,
-            round_num=0,
-        )
