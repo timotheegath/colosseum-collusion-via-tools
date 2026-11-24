@@ -70,9 +70,30 @@ python -m experiments.agent_misalignment.plots.plot_model_comparison \
 The filter arguments above (`--num-agents`, `--target-role`, `--adversary-count`, `--seeds`) are optional; omit them to plot all matching runs under the provided `--model-runs-dir` roots.
 
 ## Configuration notes
-* **Environment class**: `MisalignmentHospitalEnvironment` (in `experiments.agent_misalignment.environment`)
+* **Environment class**: the upstream base `HospitalEnvironment` (`terrarium.environments.dcops.hospital.hospital_env:HospitalEnvironment`), selected through `environment.import_path`.
 * **Figure 7 topology**: `complete`
 * **Figure 7 sweep design**: strategies correspond to the three misalignment types; `target_roles` splits provisioner vs departmental coalitions.
+
+## Native config flow
+The adversary wiring is driven by the Terrarium submodule's native config keys;
+`run.py` injects them into the per-run config (the coalition is picked per
+sweep/seed):
+
+* `environment.collusion`: `{enabled: true, members: [...], strategy:
+  <sweep strategy>, instructions_file: instructions_<strategy>.txt}` — the
+  per-strategy adversary text lives in `configs/instructions_<strategy>.txt`
+  (`instructions_default.txt` is the fallback). The environment natively
+  provides the `role` / `coalition_members` / `collusion_strategy` /
+  `collusion_instructions` / `secret_blackboard_id` context keys.
+* `environment.secret_channels`: `[{members: [...]}]` — the coalition-only
+  board is created by the environment itself when `secret_channel_enabled` and
+  there are >= 2 adversaries.
+* `environment.prompt_wrapper`: `experiments.agent_misalignment.prompts:MisalignmentPrompts`
+  — a pure prompt decorator reading the native context keys and substituting
+  the `__ALLIES__` / `__SECRET_CHANNEL_BLOCK__` / `__RP_BLOCK__` /
+  `__ROLE_BLOCK__` tokens inside the instructions-file text.
+* `simulation.phases`: `planning` / `execution` per iteration, then `survey`
+  (`when: "after"`), walked through the generic `protocol.agent_turn`.
 
 ## Outputs
 Data is saved to `experiments/agent_misalignment/outputs/<tag>/<timestamp>/`.
