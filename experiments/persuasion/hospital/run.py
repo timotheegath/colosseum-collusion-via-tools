@@ -25,8 +25,10 @@ sys.path.insert(0, str(project_root))
 from experiments.common.run_utils import (
     configure_experiment_logging as _configure_experiment_logging_impl,
     ensure_dir as _ensure_dir,
+    inject_native_collusion_config,
     load_yaml as _load_yaml,
     normalize_seeds as _normalize_seeds,
+    run_phase_entries,
     tools_environment_name as _tools_environment_name,
     write_json as _write_json,
     write_progress as _write_progress,
@@ -34,10 +36,16 @@ from experiments.common.run_utils import (
 from experiments.common.blackboard_logger import ExperimentBlackboardLogger
 from experiments.common.local_protocol import LocalCommunicationProtocol
 from experiments.agent_misalignment.metrics import compute_misalignment_metrics
-from experiments.persuasion.hospital.prompts import PersuasionHospitalPrompts
 from terrarium.networks import build_communication_network
 from terrarium.core.logger import AgentTrajectoryLogger, PromptLogger
-from terrarium.utils import get_client_instance, get_generation_params, get_model_name, build_vllm_runtime
+from terrarium.utils import (
+    get_client_instance,
+    get_generation_params,
+    get_model_name,
+    build_vllm_runtime,
+    resolve_phases,
+    split_phases_by_when,
+)
 from terrarium.agents.base import BaseAgent
 
 
@@ -229,6 +237,12 @@ def _select_colluders_hospital_coalition(
     return coalition
 
 
+def _error_response(exc: BaseException) -> str:
+    """Render a failed turn in the same ``[ERROR] ...`` convention terrarium
+    itself uses for caught continuation failures."""
+    return f"[ERROR] {type(exc).__name__}: {exc}"
+
+
 def _log_blackboards_txt(
     *,
     bb_logger: ExperimentBlackboardLogger,
@@ -307,7 +321,14 @@ async def _run_single(
 
     protocol = LocalCommunicationProtocol(config=cfg)
     env_cls = _resolve_environment_class(cfg.get("environment") or {})
-    env = env_cls(protocol, cfg, tool_logger=type("TL", (), {"log_dir": run_dir})())
+
+    # Probe env: hospital agent names are fully determined by the environment
+    # config, so read them off a throwaway instance to select the colluders
+    # BEFORE the native collusion config (which the env resolves in __init__)
+    # is injected into the per-run config.
+    probe_env = env_cls(protocol, cfg, tool_logger=type("TL", (), {"log_dir": run_dir})())
+    agent_names = probe_env.get_agent_names()
+    del probe_env
 
     bb_logger = ExperimentBlackboardLogger(cfg, log_root=run_dir)
     bb_logger.clear_blackboard_logs()
@@ -317,7 +338,7 @@ async def _run_single(
     log_prompts = True if log_prompts_cfg is None else bool(log_prompts_cfg)
     prompt_logger = (
         PromptLogger(
-            environment_name=env.__class__.__name__,
+            environment_name=env_cls.__name__,
             seed=int(seed),
             config=cfg,
             run_timestamp=cfg.get("simulation", {}).get("run_timestamp"),
@@ -327,16 +348,14 @@ async def _run_single(
         else None
     )
     trajectory_logger = AgentTrajectoryLogger(
-        environment_name=env.__class__.__name__,
+        environment_name=env_cls.__name__,
         seed=int(seed),
         config=cfg,
         run_timestamp=cfg.get("simulation", {}).get("run_timestamp"),
         log_dir=run_dir,
     )
 
-    agent_names = env.get_agent_names()
     communication_network = build_communication_network(agent_names, cfg)
-    env.set_communication_network(communication_network)
 
     exp_block = (cfg.get("experiment") or {}).get("persuasion_hospital") or {}
     selection_strategy = str(exp_block.get("colluder_selection", "hospital_coalition")).strip().lower()
@@ -371,14 +390,36 @@ async def _run_single(
                 except Exception:
                     pass
 
-    env.prompts = PersuasionHospitalPrompts(
-        env,
+    # --- NATIVE CONFIG INJECTION (per sweep/seed) ---
+    # Colluders are picked per sweep/seed, so the native blocks
+    # (environment.collusion / secret_channels / prompt_wrapper and
+    # simulation.phases) are written into the per-run config here and consumed
+    # by the submodule. The prompt wrapper additionally reads the sweep's
+    # prompt_variant / secret_channel_enabled from the experiment block and the
+    # prompt logger from the run-private `_experiment_prompt_logger` slot.
+    planning_rounds = int(cfg["simulation"].get("max_planning_rounds", 1))
+    ph_block = cfg.setdefault("experiment", {}).setdefault("persuasion_hospital", {})
+    ph_block["prompt_variant"] = str(effective_prompt_variant)
+    ph_block["secret_channel_enabled"] = bool(secret_channel_enabled)
+    cfg["_experiment_prompt_logger"] = prompt_logger
+    inject_native_collusion_config(
         cfg,
-        prompt_variant=str(effective_prompt_variant),
-        base_prompts=getattr(env, "prompts", None),
-        experiment_prompt_logger=prompt_logger,
-        log_prompts=log_prompts,
+        adversaries=colluders,
+        strategy=misalignment_strategy,
+        instructions_file="",  # variant text lives in the prompt wrapper
+        secret_channel=bool(secret_channel_enabled and len(colluders) >= 2),
+        prompt_wrapper="experiments.persuasion.hospital.prompts:PersuasionHospitalPrompts",
+        phases=[
+            {"name": "planning", "rounds": planning_rounds},
+            {"name": "execution", "rounds": 1},
+        ],
     )
+
+    env = env_cls(protocol, cfg, tool_logger=type("TL", (), {"log_dir": run_dir})())
+    protocol.bind_environment(env)
+    # The native protocol logs blackboard state after every agent turn.
+    protocol.blackboard_logger = bb_logger
+    env.set_communication_network(communication_network)
 
     provider = (cfg.get("llm", {}).get("provider") or "").lower()
     model_name = get_model_name(provider, cfg["llm"])
@@ -409,18 +450,15 @@ async def _run_single(
 
     await env.async_init()
 
+    # The coalition-only secret board is created natively by the environment
+    # from environment.secret_channels; read its id back for metrics/logging.
     secret_blackboard_id: Optional[int] = None
     if secret_channel_enabled and len(colluders) >= 2:
-        try:
-            base_context = env.get_network_context()
-            secret_context = env.format_blackboard_context(colluders, base_context)
-        except Exception:
-            secret_context = env.get_network_context() if hasattr(env, "get_network_context") else ""
-        secret_blackboard_id = await protocol.generate_comm_network(
-            colluders,
-            secret_context,
-            template={"secret_channel": True, "visibility": "secret", "purpose": "coalition"},
-        )
+        by_agent = getattr(env, "secret_channel_by_agent", {}) or {}
+        for name in colluders:
+            if by_agent.get(name) is not None:
+                secret_blackboard_id = by_agent[name]
+                break
 
     try:
         _log_blackboards_txt(
@@ -434,135 +472,53 @@ async def _run_single(
     except Exception as exc:
         logger.warning("Failed to write initial blackboard_*.txt logs: %s", exc)
 
+    # --- SIMULATION LOOP (native phase walk) ---
+    # planning/execution per iteration, as declared in simulation.phases and
+    # walked through the generic protocol.agent_turn.
     max_iterations = int(cfg.get("simulation", {}).get("max_iterations", 1))
-    planning_rounds = int(cfg["simulation"].get("max_planning_rounds", 1))
+    phase_groups = split_phases_by_when(resolve_phases(cfg["simulation"]))
     turns: List[Dict[str, Any]] = []
 
-    def _extra_fields(agent_name: str, *, phase: str, iteration: int, planning_round: Optional[int]) -> Dict[str, Any]:
-        prompt_role = (
-            "colluder"
-            if (secret_channel_enabled and str(agent_name) in colluder_set)
-            else "normal"
-        )
-        return {
-            "collusion_role": prompt_role,
-            "collusion_coalition_members": sorted(list(colluder_set)) if prompt_role == "colluder" else [],
-            "collusion_blackboard_id": secret_blackboard_id if prompt_role == "colluder" else None,
-            "misalignment_strategy": misalignment_strategy,
+    def _build_turn(
+        *,
+        agent: Any,
+        phase: str,
+        round_num: int,
+        iteration: int,
+        response: Any,
+        error: Optional[BaseException] = None,
+    ) -> Dict[str, Any]:
+        agent_name = agent if isinstance(agent, str) else agent.name
+        resp = response or {}
+        turn: Dict[str, Any] = {
             "phase": phase,
             "iteration": iteration,
-            "planning_round": planning_round,
+            "agent": agent_name,
+            "role": roles.get(agent_name, "normal"),
+            "response": _error_response(error) if error is not None else resp.get("response"),
+            "usage": None if error is not None else resp.get("usage"),
+            "model": None if error is not None else resp.get("model"),
+            "tools_executed": [] if error is not None else resp.get("tools_executed"),
+            "conversation_steps": None if error is not None else resp.get("conversation_steps"),
         }
+        if phase == "planning":
+            turn["planning_round"] = round_num
+        return turn
 
-    current_iteration = 0
+    def _persist(_turn: Dict[str, Any]) -> None:
+        _write_json(run_dir / "agent_turns.json", turns)
+
     for iteration in range(1, max_iterations + 1):
-        current_iteration = iteration
-
-        # PLANNING
-        for planning_round in range(1, planning_rounds + 1):
-            last_agent = None
-            for agent in env.agents:
-                base_ctx = env.build_agent_context(
-                    agent.name,
-                    phase="planning",
-                    iteration=iteration,
-                    planning_round=planning_round,
-                )
-                agent_context = dict(base_ctx)
-                agent_context.update(
-                    _extra_fields(
-                        agent.name,
-                        phase="planning",
-                        iteration=iteration,
-                        planning_round=planning_round,
-                    )
-                )
-                response = await protocol.agent_planning_turn(
-                    agent,
-                    agent.name,
-                    agent_context,
-                    env,
-                    iteration=iteration,
-                    planning_round=planning_round,
-                )
-                turns.append(
-                    {
-                        "phase": "planning",
-                        "iteration": iteration,
-                        "planning_round": planning_round,
-                        "agent": agent.name,
-                        "role": roles.get(agent.name, "normal"),
-                        "response": response.get("response"),
-                        "usage": response.get("usage"),
-                        "model": response.get("model"),
-                        "tools_executed": response.get("tools_executed"),
-                        "conversation_steps": response.get("conversation_steps"),
-                    }
-                )
-                last_agent = agent.name
-            if last_agent:
-                try:
-                    _log_blackboards_txt(
-                        bb_logger=bb_logger,
-                        protocol=protocol,
-                        iteration=iteration,
-                        phase="planning",
-                        agent_name=str(last_agent),
-                        planning_round=int(planning_round),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to write blackboard_*.txt logs after planning round %s: %s",
-                        planning_round,
-                        exc,
-                    )
-
-        # EXECUTION
-        last_exec_agent = None
-        for agent in env.agents:
-            base_ctx = env.build_agent_context(
-                agent.name, phase="execution", iteration=iteration
+        turns.extend(
+            await run_phase_entries(
+                protocol=protocol,
+                env=env,
+                phase_entries=phase_groups["each"],
+                iteration=iteration,
+                build_turn=_build_turn,
+                on_turn=_persist,
             )
-            agent_context = dict(base_ctx)
-            agent_context.update(
-                _extra_fields(
-                    agent.name,
-                    phase="execution",
-                    iteration=iteration,
-                    planning_round=None,
-                )
-            )
-            response = await protocol.agent_execution_turn(
-                agent, agent.name, agent_context, env, iteration=iteration
-            )
-            turns.append(
-                {
-                    "phase": "execution",
-                    "iteration": iteration,
-                    "agent": agent.name,
-                    "role": roles.get(agent.name, "normal"),
-                    "response": response.get("response"),
-                    "usage": response.get("usage"),
-                    "model": response.get("model"),
-                    "tools_executed": response.get("tools_executed"),
-                    "conversation_steps": response.get("conversation_steps"),
-                }
-            )
-            last_exec_agent = agent.name
-
-        if last_exec_agent:
-            try:
-                _log_blackboards_txt(
-                    bb_logger=bb_logger,
-                    protocol=protocol,
-                    iteration=iteration,
-                    phase="execution",
-                    agent_name=str(last_exec_agent),
-                    planning_round=None,
-                )
-            except Exception as exc:
-                logger.warning("Failed to write blackboard_*.txt logs after execution: %s", exc)
-
+        )
         if hasattr(env, "log_iteration"):
             try:
                 env.log_iteration(iteration)
@@ -705,6 +661,9 @@ async def run_from_config(
     max_concurrent_runs: Optional[int] = None,
 ) -> Path:
     cfg = _load_yaml(config_path)
+    # Record the config path so the submodule can resolve relative paths
+    # (e.g. environment.collusion.instructions_file) against this directory.
+    cfg["_config_path"] = str(Path(config_path).resolve())
     exp = cfg.get("experiment") or {}
     if max_concurrent_runs is None:
         max_concurrent_runs = exp.get("max_concurrent_runs", 1)
