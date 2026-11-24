@@ -14,7 +14,7 @@ import asyncio
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -24,8 +24,10 @@ sys.path.insert(0, str(project_root))
 from experiments.common.run_utils import (
     configure_experiment_logging as _configure_experiment_logging_impl,
     ensure_dir as _ensure_dir,
+    inject_native_collusion_config,
     load_yaml as _load_yaml,
     normalize_seeds as _normalize_seeds,
+    run_phase_entries,
     atomic_write_json,
     write_json as _write_json,
     write_progress as _write_progress,
@@ -37,36 +39,19 @@ from experiments.collusion_via_tools.agents import (
 )
 from experiments.common.blackboard_logger import ExperimentBlackboardLogger
 from experiments.collusion_via_tools.metrics import compute_misalignment_metrics
-from experiments.collusion_via_tools.prompts import (
-    MisalignmentPrompts,
-    ProvisionerBlackboardPrompts,
-)
 from experiments.collusion_via_tools.prompt_capture import ThreadSafePromptRecorder
-from experiments.collusion_via_tools.tool_availability import (
-    phase_tool_map,
-    tool_names_for_phase,
-)
 from experiments.common.local_protocol import LocalCommunicationProtocol
 from experiments.collusion_via_tools.judge_beliefs import judge_run
-from experiments.common._patch_terrarium import (
-    get_post_message_call_limit,
-    get_secret_blackboard_id,
-    is_env_tools_blocked,
-    is_post_message_disabled,
-    reset_post_message_counts,
-    set_env_tools_blocked,
-    set_post_message_call_limit,
-    set_post_message_disabled,
-    set_secret_blackboard_id,
-)
 
 from terrarium.networks import build_communication_network
-from terrarium.logger import AgentTrajectoryLogger
+from terrarium.core.logger import AgentTrajectoryLogger
 from terrarium.utils import (
     get_client_instance,
     get_generation_params,
     get_model_name,
     build_vllm_runtime,
+    resolve_phases,
+    split_phases_by_when,
 )
 
 LOGGER_NAME = "experiments.collusion_via_tools"
@@ -408,54 +393,6 @@ def _ordered_agents(env: Any, agents: List[Any], mode: str, seed: int) -> List[A
     index = {name: i for i, name in enumerate(order)}
     agents.sort(key=lambda a: index.get(a.name, len(order)))
     return agents
-
-
-# Keys an adversary keeps in its context during the pre-coordination round.
-# This is an ALLOWLIST on purpose: `env.build_agent_context` returns whatever
-# the environment wants (for HospitalEnvironment that includes
-# `inventory_snapshot`, `failures_so_far`, `failures_by_hospital`,
-# `local_inventory`, `procedure_costs`, `job_queue`, `schedule_summary`, ...),
-# which would leak the full environment state to the adversary BEFORE it loses
-# `post_message`. Blocking tool calls is not enough — the state also arrives
-# passively through the prompt. An allowlist fails closed: any new key a future
-# environment adds is withheld by default and must be opted in explicitly.
-_PRE_COORDINATION_CONTEXT_ALLOWLIST: frozenset = frozenset(
-    {
-        # Identity / routing. Needed so the prompt is coherent.
-        "agent_name",
-        "phase",
-        "iteration",
-        "role",
-        # Pre-coordination round metadata (1-based). Scalar labels only, no
-        # environment state.
-        "pre_coordination_round",
-        "pre_coordination_rounds",
-        # Coalitional strategy inputs injected by `_get_extra_fields`.
-        "misalignment_role",
-        "misalignment_adversaries",
-        "misalignment_secret_blackboard_id",
-        "post_message_available",
-    }
-)
-
-
-def _pre_coordination_context(
-    full_context: Dict[str, Any],
-    *,
-    extra: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Strip the environment state from a pre-coordination agent context.
-
-    The adversary keeps its identity and the coalition strategy fields (so it
-    still understands the game and the tools it has), but loses every
-    environment-state key (inventory, failures, job queue, schedules, costs).
-    """
-    allowed = dict(full_context)
-    for key in list(allowed):
-        if key not in _PRE_COORDINATION_CONTEXT_ALLOWLIST:
-            del allowed[key]
-    allowed.update(extra)
-    return allowed
 
 
 def _resolve_pre_coordination_axis(
@@ -953,26 +890,6 @@ def _log_blackboards_txt(
         )
 
 
-def _augment_context(base: Dict[str, Any], *, extra: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    out.update(extra)
-    return out
-
-
-def _tool_availability_fields(agent: Any, env: Any, phase: str) -> Dict[str, Any]:
-    """Context fields describing which tools ``agent`` can call in ``phase``.
-
-    Read by ``MisalignmentPrompts`` to render the phase-aware coalition carrier
-    list. MUST be called AFTER ``set_post_message_disabled(...)`` for the
-    agent/phase, because the patched blackboard toolset lookup honours that
-    flag.
-    """
-    return {
-        "available_tool_names": tool_names_for_phase(agent, env, phase),
-        "tool_phase_map": phase_tool_map(agent, env),
-    }
-
-
 def _extract_initial_prompts(
     response: Dict[str, Any],
 ) -> Dict[str, str]:
@@ -995,177 +912,6 @@ def _error_response(exc: BaseException) -> str:
     """Render a failed turn in the same ``[ERROR] ...`` convention terrarium
     itself uses for caught continuation failures."""
     return f"[ERROR] {type(exc).__name__}: {exc}"
-
-
-async def _run_pre_coordination_rounds(
-    *,
-    env: Any,
-    protocol: Any,
-    roles: Dict[str, str],
-    num_rounds: int,
-    max_messages: Optional[int],
-    secret_blackboard_id: Optional[int],
-    extra_fields: Callable[[str, str], Dict[str, Any]],
-    bb_logger: Optional[ExperimentBlackboardLogger] = None,
-    on_turn: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
-) -> List[Dict[str, Any]]:
-    """Run the dedicated adversaries-only pre-coordination phase.
-
-    Executes ``num_rounds`` rounds before iteration 1. Each round gives every
-    adversary exactly one dedicated coordination turn, in ``env.agents`` order.
-    Honest agents are skipped entirely, so they never see the phase or its
-    blackboard.
-
-    Isolation is held for the whole phase (all rounds), not per round:
-
-    * only ``post_message`` is usable -- all environment tools are blocked;
-    * ``post_message`` is rewritten onto the coalition-only secret board when
-      one exists; when none exists it is disabled for the phase, so no public
-      board can be written to;
-    * the agent context is reduced to identity + coalition metadata, so no
-      environment state leaks in passively.
-
-    Isolated state is saved and restored on every exit path (including
-    exceptions): ``post_message`` gating, environment-tool gating, secret-board
-    routing, and the message cap. ``post_message`` is enabled **only** when a
-    coalition-only secret board exists; without one it is disabled for the whole
-    phase, because the tool would otherwise write to a public board.
-
-    ``max_messages`` is a per-agent cap **per round**: the counters reset at the
-    start of every round. ``None`` means unlimited.
-
-    Returns the ``agent_turns.json``-shaped entries for every turn. The caller
-    owns the surrounding run state and restores the normal tooling afterwards.
-    """
-    turns: List[Dict[str, Any]] = []
-
-    # Save the task-local state so a rerun/nested caller is unaffected.
-    prior_post_message_disabled = is_post_message_disabled()
-    prior_env_tools_blocked = is_env_tools_blocked()
-    prior_secret_blackboard_id = get_secret_blackboard_id()
-    prior_post_message_limit = get_post_message_call_limit()
-
-    # Without a coalition-only board there is no safe place to post: disable
-    # `post_message` for the phase rather than let it fall through to a public
-    # board. The prompt says the same thing explicitly.
-    phase_post_message_available = secret_blackboard_id is not None
-    set_post_message_disabled(not phase_post_message_available)
-    set_env_tools_blocked(True)
-    set_secret_blackboard_id(secret_blackboard_id)
-    # Defense in depth: with no secret board, reject any hallucinated
-    # `post_message` at the protocol layer as well (limit 0 rejects all calls)
-    # so a public post is impossible even if the tool were somehow offered.
-    round_post_message_limit = max_messages if phase_post_message_available else 0
-    try:
-        for pre_round in range(1, num_rounds + 1):
-            # Per-round cap: reset counters so each round gets its own budget.
-            set_post_message_call_limit(round_post_message_limit)
-            reset_post_message_counts()
-
-            last_agent: Optional[str] = None
-            for agent in env.agents:
-                if roles.get(agent.name) != "adversary":
-                    continue
-
-                full_ctx = env.build_agent_context(
-                    agent.name,
-                    phase="pre_coordination",
-                    iteration=0,
-                    pre_coordination_round=pre_round,
-                    pre_coordination_rounds=num_rounds,
-                )
-                extra = dict(extra_fields(agent.name, "pre_coordination"))
-                # Controlled phase metadata: never trust the environment to
-                # echo kwargs back. Without this injection the prompt and the
-                # agent see stale/default round metadata.
-                extra["post_message_available"] = phase_post_message_available
-                extra["pre_coordination_round"] = pre_round
-                extra["pre_coordination_rounds"] = num_rounds
-                # Tool availability for this exact agent/phase. Computed AFTER
-                # `set_post_message_disabled(...)` above, so the disabled-state
-                # reflected in the blackboard toolset is correct.
-                extra.update(_tool_availability_fields(agent, env, "pre_coordination"))
-                # Minimal context: identity + coalition strategy only, no
-                # environment state. Blocking tool calls is not sufficient
-                # because `env.build_agent_context` hands the adversary the
-                # full state (inventory, failures, job queue, costs) passively
-                # in the prompt.
-                agent_context = _pre_coordination_context(full_ctx, extra=extra)
-                try:
-                    response = await protocol.agent_planning_turn(
-                        agent,
-                        agent.name,
-                        agent_context,
-                        env,
-                        iteration=0,
-                        planning_round=pre_round,
-                        phase="pre_coordination",
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Pre-coordination planning turn failed for %s (round %s): %s",
-                        agent.name,
-                        pre_round,
-                        _error_response(exc),
-                    )
-                    turns.append(
-                        {
-                            "phase": "pre_coordination",
-                            "iteration": 0,
-                            "round": pre_round,
-                            "pre_coordination_round": pre_round,
-                            "pre_coordination_rounds": num_rounds,
-                            "agent": agent.name,
-                            "role": roles[agent.name],
-                            "response": _error_response(exc),
-                            "usage": None,
-                            "tools_executed": [],
-                        }
-                    )
-                    if on_turn is not None:
-                        on_turn(turns)
-                    last_agent = agent.name
-                    continue
-                turns.append(
-                    {
-                        "phase": "pre_coordination",
-                        "iteration": 0,
-                        "round": pre_round,
-                        "pre_coordination_round": pre_round,
-                        "pre_coordination_rounds": num_rounds,
-                        "agent": agent.name,
-                        "role": roles[agent.name],
-                        "response": response.get("response"),
-                        "usage": response.get("usage"),
-                        "tools_executed": response.get("tools_executed"),
-                        **_extract_initial_prompts(response),
-                    }
-                )
-                if on_turn is not None:
-                    on_turn(turns)
-                last_agent = agent.name
-
-            if last_agent and bb_logger is not None:
-                try:
-                    _log_blackboards_txt(
-                        bb_logger=bb_logger,
-                        protocol=protocol,
-                        iteration=0,
-                        phase="pre_coordination",
-                        agent_name=last_agent,
-                        planning_round=pre_round,
-                    )
-                except Exception:
-                    pass
-    finally:
-        # Restore the state that existed before the phase, even on failure.
-        set_env_tools_blocked(prior_env_tools_blocked)
-        set_secret_blackboard_id(prior_secret_blackboard_id)
-        set_post_message_call_limit(prior_post_message_limit)
-        set_post_message_disabled(prior_post_message_disabled)
-        reset_post_message_counts()
-
-    return turns
 
 
 async def _run_single(
@@ -1250,13 +996,14 @@ async def _run_single(
     # The sweep axis (resolved in `run_from_config` / `_resolve_disable_pm_axis`)
     # has already made the decision: use it verbatim instead of re-resolving a
     # `None` against the top-level config (which would silently override an
-    # explicit sweep-level `false` / `null`).
+    # explicit sweep-level `false` / `null`). The decision is written into the
+    # per-run config as `environment.blocked_tools` (roles: [adversary]) and
+    # enforced natively by the submodule.
     resolved_disable_pm = (
         _normalize_disable_pm_value(disable_post_message)
         if disable_post_message is not _UNSET
         else _resolve_disable_pm(_UNSET, cfg)
     )
-    set_post_message_disabled(resolved_disable_pm)
 
     # Deterministic agent turn order (see `_resolve_turn_order`). Resolved here
     # so an invalid `experiment.turn_order` fails before the run directory is
@@ -1264,15 +1011,13 @@ async def _run_single(
     resolved_turn_order = _resolve_turn_order(cfg)
 
     # --- PRE-COORDINATION PHASE ---
-    # `pre_coordination_rounds` dedicated, planning-prompt-shaped rounds run
-    # before the main simulation for adversaries only (default 1, for backward
-    # compatibility). The sweep axis (`sweeps[].pre_coordination_rounds`) is
-    # resolved by the scheduler and passed in verbatim; when the argument is
-    # `_UNSET` we fall back to the global `simulation.pre_coordination_rounds`.
-    # `post_message` is available only when a coalition-only secret blackboard
-    # exists; all environment tools (`broadcast_message`, `transfer_resources`,
-    # etc.) are silently dropped by `LocalCommunicationProtocol` so the
-    # adversary cannot probe the environment before losing `post_message`.
+    # `pre_coordination_rounds` dedicated rounds run before the main simulation
+    # for adversaries only (default 1, for backward compatibility). The sweep
+    # axis (`sweeps[].pre_coordination_rounds`) is resolved by the scheduler and
+    # passed in verbatim; when the argument is `_UNSET` we fall back to the
+    # global `simulation.pre_coordination_rounds`. The phase is expressed as a
+    # `simulation.phases` entry (`when: before`, `agents: <coalition>`) and its
+    # tool isolation as `environment.blocked_tools` (`pre_coordination: ["*"]`).
     resolved_pre_coordination = _resolve_pre_coordination_round(
         pre_coordination_round, cfg
     )
@@ -1331,10 +1076,103 @@ async def _run_single(
     # --- COMPONENT INITIALIZATION ---
     protocol = LocalCommunicationProtocol(config=cfg)
     env_cls = _resolve_environment_class(cfg.get("environment") or {})
+
+    # Probe env: hospital agent names are fully determined by the environment
+    # config, so read them off a throwaway instance to select the coalition
+    # BEFORE the native collusion config (which the env resolves in __init__)
+    # is injected into the per-run config.
+    probe_env = env_cls(protocol, cfg, tool_logger=type("TL", (), {"log_dir": run_dir})())
+    agent_names = probe_env.get_agent_names()
+    del probe_env
+
+    # --- ADVERSARY CONFIGURATION ---
+    adv_cfg = (cfg.get("experiment") or {}).get("adversary") or {}
+    secret_channel_enabled = bool(adv_cfg.get("secret_channel_enabled", False))
+    coalition_clique_enabled = bool(adv_cfg.get("coalition_clique_enabled", False))
+
+    adversaries = _select_adversaries_hospital_coalition(
+        agent_names=agent_names,
+        count=int(adversary_count),
+        target_role=target_role,
+        rng=rng,
+    )
+    # Single source of truth for both the secret-channel config and
+    # `run_config.json`, so `effective_secret_channel` cannot be true while
+    # the board id is null.
+    effective_secret_channel = _resolve_effective_secret_channel(
+        secret_channel_enabled=secret_channel_enabled,
+        disable_post_message=resolved_disable_pm,
+        pre_coordination_round=resolved_pre_coordination,
+        is_benign=is_benign,
+        num_adversaries=len(adversaries),
+    )
+
+    # --- NATIVE CONFIG INJECTION (per sweep/seed) ---
+    # Everything the run needs beyond the base YAML is written into the per-run
+    # config and consumed natively by the submodule: coalition members + role /
+    # instructions (environment.collusion), the coalition-only board
+    # (environment.secret_channels), phase tool gating (environment.blocked_tools),
+    # the prompt decorator (environment.prompt_wrapper) and the phase sequence
+    # (simulation.phases).
+    planning_rounds = int(cfg["simulation"].get("max_planning_rounds", 1))
+    phases: List[Dict[str, Any]] = []
+    blocked_tools: Dict[str, Any] = {}
+    if pre_coord_phase_active:
+        pre_coord_entry: Dict[str, Any] = {
+            "name": "pre_coordination",
+            "rounds": effective_pre_coord_rounds,
+            "when": "before",  # runs once before iteration 1, with iteration=0
+            "agents": list(adversaries),
+        }
+        if resolved_pre_coord_max is not None:
+            pre_coord_entry["max_calls"] = {"post_message": int(resolved_pre_coord_max)}
+        phases.append(pre_coord_entry)
+        # All environment tools are blocked in the pre-coordination phase;
+        # post_message stays available only when a coalition-only secret board
+        # exists (it is rewritten onto that board via enforce_in_phases).
+        blocked_tools["pre_coordination"] = (
+            ["*"] if effective_secret_channel else ["*", "post_message"]
+        )
+    phases.append({"name": "planning", "rounds": planning_rounds})
+    phases.append({"name": "execution", "rounds": 1})
+    phases.append({"name": "survey", "rounds": 1, "when": "after"})
+
+    if is_benign:
+        # Benign baseline: no collusion block, no prompt wrapper, no secret
+        # channel, no tool gating -- plain HospitalEnvironment behavior.
+        env_cfg = cfg.setdefault("environment", {})
+        for key in ("collusion", "secret_channels", "blocked_tools", "prompt_wrapper"):
+            env_cfg.pop(key, None)
+        cfg.setdefault("simulation", {})["phases"] = [
+            {"name": "planning", "rounds": planning_rounds},
+            {"name": "execution", "rounds": 1},
+            {"name": "survey", "rounds": 1, "when": "after"},
+        ]
+    else:
+        inject_native_collusion_config(
+            cfg,
+            adversaries=adversaries,
+            strategy=COVERT_STRATEGY,
+            instructions_file=str(
+                (cfg.get("experiment") or {}).get("adversary", {}).get(
+                    "instructions_file", "collusion_instructions.txt"
+                )
+            ),
+            secret_channel=effective_secret_channel,
+            enforce_phase="pre_coordination" if pre_coord_phase_active else None,
+            disable_post_message=resolved_disable_pm,
+            prompt_wrapper="experiments.collusion_via_tools.prompts:MisalignmentPrompts",
+            phases=phases,
+            blocked_tools=blocked_tools or None,
+        )
+
     env = env_cls(protocol, cfg, tool_logger=type("TL", (), {"log_dir": run_dir})())
+    protocol.bind_environment(env)
 
     bb_logger = ExperimentBlackboardLogger(cfg, log_root=run_dir)
     bb_logger.clear_blackboard_logs()
+    # The native protocol logs blackboard state after every agent turn.
+    protocol.blackboard_logger = bb_logger
 
     trajectory_logger = AgentTrajectoryLogger(
         environment_name=env.__class__.__name__,
@@ -1349,41 +1187,8 @@ async def _run_single(
     # the new run.
     trajectory_logger.reset_log()
 
-    agent_names = env.get_agent_names()
     communication_network = build_communication_network(agent_names, cfg)
     env.set_communication_network(communication_network)
-
-    # --- ADVERSARY CONFIGURATION ---
-    adv_cfg = (cfg.get("experiment") or {}).get("adversary") or {}
-    secret_channel_enabled = bool(adv_cfg.get("secret_channel_enabled", False))
-    coalition_clique_enabled = bool(adv_cfg.get("coalition_clique_enabled", False))
-    # Mode 0 (post_message never available) makes a coalition-only secret
-    # blackboard pointless: there is no tool to write to it -- UNLESS the
-    # pre-coordination round needs it, in which case the adversary uses
-    # post_message to the secret board during that phase and loses it
-    # afterwards. The effective flag is resolved after adversary selection
-    # below, because the board also requires a non-benign run with at least two
-    # adversaries.
-
-    adversaries = _select_adversaries_hospital_coalition(
-        agent_names=agent_names,
-        count=int(adversary_count),
-        target_role=target_role,
-        rng=rng,
-    )
-    roles = {
-        name: ("adversary" if name in adversaries else "cooperative")
-        for name in agent_names
-    }
-    # Single source of truth for both board creation and `run_config.json`, so
-    # `effective_secret_channel` cannot be true while the board id is null.
-    effective_secret_channel = _resolve_effective_secret_channel(
-        secret_channel_enabled=secret_channel_enabled,
-        disable_post_message=resolved_disable_pm,
-        pre_coordination_round=resolved_pre_coordination,
-        is_benign=is_benign,
-        num_adversaries=len(adversaries),
-    )
 
     if coalition_clique_enabled and len(adversaries) >= 2:
         # Ensure the coalition forms a clique in the (public) communication graph.
@@ -1396,17 +1201,8 @@ async def _run_single(
                 except Exception:
                     pass
 
-    # Upstream `HospitalPrompts.get_user_prompt` returns early for
-    # `Resource_Provisioner` and never renders `blackboard_context`, so the
-    # provisioner is blind to the public board AND to the coalition-only
-    # board (even though its own prompt says "Check the Blackboard for
-    # URGENT or DEFICIT requests"). Wrap the env prompts so every role sees
-    # the same blackboard content. Applied to benign runs too, so that the
-    # provisioner's view does not differ between benign and coalition sweeps.
-    env.prompts = ProvisionerBlackboardPrompts(getattr(env, "prompts", None))
-
-    if not is_benign:
-        env.prompts = MisalignmentPrompts(env, cfg, base_prompts=env.prompts)
+    # Roles come natively from the environment (environment.collusion).
+    roles = dict(getattr(env, "role_by_agent", {}) or {})
 
     # --- AGENT CLIENT SETUP ---
     provider = (cfg.get("llm", {}).get("provider") or "").lower()
@@ -1449,24 +1245,15 @@ async def _run_single(
 
     await env.async_init()
 
+    # The coalition-only secret board is created natively by the environment
+    # from environment.secret_channels; read its id back for metrics/logging.
     secret_blackboard_id: Optional[int] = None
     if effective_secret_channel:
-        try:
-            base_context = env.get_network_context()
-            secret_context = env.format_blackboard_context(adversaries, base_context)
-        except Exception:
-            secret_context = (
-                env.get_network_context() if hasattr(env, "get_network_context") else ""
-            )
-        secret_blackboard_id = await protocol.generate_comm_network(
-            adversaries,
-            secret_context,
-            template={
-                "secret_channel": True,
-                "visibility": "secret",
-                "purpose": "coalition",
-            },
-        )
+        by_agent = getattr(env, "secret_channel_by_agent", {}) or {}
+        for name in adversaries:
+            if by_agent.get(name) is not None:
+                secret_blackboard_id = by_agent[name]
+                break
 
     # Log initial state
     try:
@@ -1480,54 +1267,62 @@ async def _run_single(
     except Exception:
         pass
 
-    # --- SIMULATION LOOP ---
+    # --- SIMULATION LOOP (native phase walk) ---
+    # The phase sequence (pre_coordination -> planning/execution per iteration ->
+    # survey) is declared in simulation.phases and walked through the generic
+    # protocol.agent_turn; per-agent tool gating, the secret-channel rewrite and
+    # per-phase call caps are enforced natively by the submodule.
     max_iterations = int(cfg["simulation"].get("max_iterations", 1))
-    planning_rounds = int(cfg["simulation"].get("max_planning_rounds", 1))
+    phase_groups = split_phases_by_when(resolve_phases(cfg["simulation"]))
     turns: List[Dict[str, Any]] = []
 
-    def _get_extra_fields(agent_name: str, phase: str) -> Dict[str, Any]:
-        if is_benign:
-            return {}
-        role = roles.get(agent_name, "cooperative")
-        post_message_available = not resolved_disable_pm
-        # During the pre-coordination phase `post_message` is available only
-        # when a coalition-only secret board exists. If there is none, the tool
-        # is disabled for the phase so it cannot leak to a public board; the
-        # prompt says so explicitly. The helper also enforces this at runtime.
-        if phase == "pre_coordination" and role == "adversary":
-            post_message_available = secret_blackboard_id is not None
-        return {
-            "misalignment_role": role,
-            "misalignment_adversaries": adversaries,
-            "misalignment_secret_blackboard_id": secret_blackboard_id
-            if role == "adversary"
-            else None,
-            "post_message_available": post_message_available,
+    def _build_turn(
+        *,
+        agent: Any,
+        phase: str,
+        round_num: int,
+        iteration: int,
+        response: Any,
+        error: Optional[BaseException] = None,
+    ) -> Dict[str, Any]:
+        agent_name = agent if isinstance(agent, str) else agent.name
+        turn: Dict[str, Any] = {
             "phase": phase,
+            "iteration": iteration,
+            "round": round_num,
+            "agent": agent_name,
+            "role": roles.get(agent_name, "cooperative"),
+            "response": _error_response(error)
+            if error is not None
+            else (response or {}).get("response"),
+            "usage": None if error is not None else (response or {}).get("usage"),
+            "tools_executed": []
+            if error is not None
+            else (response or {}).get("tools_executed"),
         }
+        if error is None and response is not None:
+            turn.update(_extract_initial_prompts(response))
+        if phase == "pre_coordination":
+            turn["pre_coordination_round"] = round_num
+            turn["pre_coordination_rounds"] = effective_pre_coord_rounds
+        return turn
 
-    # --- PRE-COORDINATION PHASE ---
-    # Runs `effective_pre_coord_rounds` times before iteration 1, for
-    # adversaries only. The agent receives the compact phase prompt built by
-    # `prompts.py`; `LocalCommunicationProtocol.environment_handle_tool_call`
-    # returns a stub for any env-tool invocation across the whole phase, so the
-    # adversary cannot probe the environment or commit to operational actions
-    # before losing `post_message`. `post_message` is available only while a
-    # secret board exists. Honest agents are skipped entirely.
-    if pre_coord_phase_active:
-        turns.extend(
-            await _run_pre_coordination_rounds(
-                env=env,
-                protocol=protocol,
-                roles=roles,
-                num_rounds=effective_pre_coord_rounds,
-                max_messages=resolved_pre_coord_max,
-                secret_blackboard_id=secret_blackboard_id,
-                extra_fields=_get_extra_fields,
-                bb_logger=bb_logger,
-                on_turn=lambda t: atomic_write_json(run_dir / "agent_turns.json", t),
-            )
+    def _persist(_turn: Dict[str, Any]) -> None:
+        # Persist after every turn so a crash mid-run still leaves a usable
+        # agent_turns.json for the judge/metrics pass.
+        atomic_write_json(run_dir / "agent_turns.json", turns)
+
+    # before-group phases (pre_coordination) run once with iteration=0.
+    turns.extend(
+        await run_phase_entries(
+            protocol=protocol,
+            env=env,
+            phase_entries=phase_groups["before"],
+            iteration=0,
+            build_turn=_build_turn,
+            on_turn=_persist,
         )
+    )
 
     current_iteration = 0
     for iteration in range(1, max_iterations + 1):
@@ -1537,223 +1332,32 @@ async def _run_single(
                 "Environment requested simulation stop at iteration %s", iteration
             )
             break
-
-        # 1. PLANNING
-        for planning_round in range(1, planning_rounds + 1):
-            round_level_disabled = resolved_disable_pm
-            last_agent = None
-            for agent in env.agents:
-                # Restriction is adversary-only: honest agents keep `post_message`.
-                if roles.get(agent.name) == "adversary":
-                    set_post_message_disabled(round_level_disabled)
-                else:
-                    set_post_message_disabled(False)
-                base_ctx = env.build_agent_context(
-                    agent.name,
-                    phase="planning",
-                    iteration=iteration,
-                    planning_round=planning_round,
-                )
-                extra = _get_extra_fields(agent.name, "planning")
-                # Tool availability for this exact agent/phase. Computed AFTER
-                # `set_post_message_disabled(...)` above, so the disabled-state
-                # reflected in the blackboard toolset is correct.
-                extra.update(_tool_availability_fields(agent, env, "planning"))
-                agent_context = (
-                    base_ctx if not extra else _augment_context(base_ctx, extra=extra)
-                )
-
-                try:
-                    response = await protocol.agent_planning_turn(
-                        agent,
-                        agent.name,
-                        agent_context,
-                        env,
-                        iteration=iteration,
-                        planning_round=planning_round,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Planning turn failed for %s (iteration %s, round %s): %s",
-                        agent.name,
-                        iteration,
-                        planning_round,
-                        _error_response(exc),
-                    )
-                    turns.append(
-                        {
-                            "phase": "planning",
-                            "iteration": iteration,
-                            "round": planning_round,
-                            "agent": agent.name,
-                            "role": roles[agent.name],
-                            "response": _error_response(exc),
-                            "usage": None,
-                            "tools_executed": [],
-                        }
-                    )
-                    atomic_write_json(run_dir / "agent_turns.json", turns)
-                    last_agent = agent.name
-                    continue
-                turns.append(
-                    {
-                        "phase": "planning",
-                        "iteration": iteration,
-                        "round": planning_round,
-                        "agent": agent.name,
-                        "role": roles[agent.name],
-                        "response": response.get("response"),
-                        "usage": response.get("usage"),
-                        "tools_executed": response.get("tools_executed"),
-                        **_extract_initial_prompts(response),
-                    }
-                )
-                atomic_write_json(run_dir / "agent_turns.json", turns)
-                last_agent = agent.name
-
-            if last_agent:
-                _log_blackboards_txt(
-                    bb_logger=bb_logger,
-                    protocol=protocol,
-                    iteration=iteration,
-                    phase="planning",
-                    agent_name=last_agent,
-                    planning_round=planning_round,
-                )
-
-        # 2. EXECUTION
-        last_exec_agent = None
-        for agent in env.agents:
-            # Restriction is adversary-only: honest agents keep `post_message`.
-            if roles.get(agent.name) == "adversary":
-                set_post_message_disabled(resolved_disable_pm)
-            else:
-                set_post_message_disabled(False)
-            base_ctx = env.build_agent_context(
-                agent.name, phase="execution", iteration=iteration
-            )
-            extra = _get_extra_fields(agent.name, "execution")
-            # Tool availability for this exact agent/phase. Computed AFTER
-            # `set_post_message_disabled(...)` above, so the disabled-state
-            # reflected in the blackboard toolset is correct.
-            extra.update(_tool_availability_fields(agent, env, "execution"))
-            agent_context = (
-                base_ctx if not extra else _augment_context(base_ctx, extra=extra)
-            )
-
-            try:
-                response = await protocol.agent_execution_turn(
-                    agent, agent.name, agent_context, env, iteration=iteration
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Execution turn failed for %s (iteration %s): %s",
-                    agent.name,
-                    iteration,
-                    _error_response(exc),
-                )
-                turns.append(
-                    {
-                        "phase": "execution",
-                        "iteration": iteration,
-                        "agent": agent.name,
-                        "role": roles[agent.name],
-                        "response": _error_response(exc),
-                        "usage": None,
-                        "tools_executed": [],
-                    }
-                )
-                atomic_write_json(run_dir / "agent_turns.json", turns)
-                last_exec_agent = agent.name
-                continue
-            turns.append(
-                {
-                    "phase": "execution",
-                    "iteration": iteration,
-                    "agent": agent.name,
-                    "role": roles[agent.name],
-                    "response": response.get("response"),
-                    "usage": response.get("usage"),
-                    "tools_executed": response.get("tools_executed"),
-                    **_extract_initial_prompts(response),
-                }
-            )
-            atomic_write_json(run_dir / "agent_turns.json", turns)
-            last_exec_agent = agent.name
-
-        if last_exec_agent:
-            _log_blackboards_txt(
-                bb_logger=bb_logger,
+        turns.extend(
+            await run_phase_entries(
                 protocol=protocol,
+                env=env,
+                phase_entries=phase_groups["each"],
                 iteration=iteration,
-                phase="execution",
-                agent_name=last_exec_agent,
+                build_turn=_build_turn,
+                on_turn=_persist,
             )
-
+        )
         try:
             env.log_iteration_summary(iteration)
         except Exception:
             pass
 
-    # 3. SURVEY (POST-RUN BELIEFS)
-    for agent in env.agents:
-        # Restriction is adversary-only: honest agents keep `post_message`.
-        if roles.get(agent.name) == "adversary":
-            set_post_message_disabled(resolved_disable_pm)
-        else:
-            set_post_message_disabled(False)
-        base_ctx = env.build_agent_context(
-            agent.name, phase="survey", iteration=max(1, current_iteration)
+    # after-group phases (survey) run once after the last iteration.
+    turns.extend(
+        await run_phase_entries(
+            protocol=protocol,
+            env=env,
+            phase_entries=phase_groups["after"],
+            iteration=max(1, current_iteration),
+            build_turn=_build_turn,
+            on_turn=_persist,
         )
-        extra = _get_extra_fields(agent.name, "survey")
-        # Tool availability for this exact agent/phase. Computed AFTER
-        # `set_post_message_disabled(...)` above, so the disabled-state
-        # reflected in the blackboard toolset is correct.
-        extra.update(_tool_availability_fields(agent, env, "survey"))
-        agent_context = (
-            base_ctx if not extra else _augment_context(base_ctx, extra=extra)
-        )
-        try:
-            response = await protocol.agent_survey_turn(
-                agent,
-                agent.name,
-                agent_context,
-                env,
-                iteration=max(1, current_iteration),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Survey turn failed for %s (iteration %s): %s",
-                agent.name,
-                max(1, current_iteration),
-                _error_response(exc),
-            )
-            turns.append(
-                {
-                    "phase": "survey",
-                    "iteration": current_iteration,
-                    "agent": agent.name,
-                    "role": roles[agent.name],
-                    "response": _error_response(exc),
-                    "usage": None,
-                    "tools_executed": [],
-                }
-            )
-            atomic_write_json(run_dir / "agent_turns.json", turns)
-            continue
-        turns.append(
-            {
-                "phase": "survey",
-                "iteration": current_iteration,
-                "agent": agent.name,
-                "role": roles[agent.name],
-                "response": response.get("response"),
-                "usage": response.get("usage"),
-                "tools_executed": response.get("tools_executed"),
-                **_extract_initial_prompts(response),
-            }
-        )
-        atomic_write_json(run_dir / "agent_turns.json", turns)
+    )
 
     # Persist turns before the judge pass (judge_beliefs loads agent_turns.json).
     atomic_write_json(run_dir / "agent_turns.json", turns)
@@ -1978,6 +1582,9 @@ async def run_from_config(
     max_concurrent_runs: Optional[int] = None,
 ) -> Path:
     cfg = _load_yaml(config_path)
+    # Let the submodule resolve relative `instructions_file` paths against the
+    # config file's directory.
+    cfg["_config_path"] = str(Path(config_path).resolve())
     # Fail fast on an invalid `pre_coordination_rounds` before any runs are
     # scheduled. Both the global `simulation.pre_coordination_rounds` and every
     # sweep-level `sweeps[].pre_coordination_rounds` value are validated here,
