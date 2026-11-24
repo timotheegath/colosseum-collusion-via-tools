@@ -1,3 +1,6 @@
 [submodule "external/CoLLAB"]
 	path = external/CoLLAB
 	url = https://github.com/Saad-Mahmud/CoLLAB_SEA.git
+[submodule "external/Terrarium"]
+	path = external/Terrarium
+	url = git@github.com:timotheegath/Terrarium-tool-collusion-subfork.git
