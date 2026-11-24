@@ -83,28 +83,43 @@ _BUILTIN_VARIANTS: Dict[str, str] = {
 
 
 class PersuasionHospitalPrompts:
-    """Prompt wrapper that injects persuasion-collusion instructions for coalition members only."""
+    """Prompt wrapper that injects persuasion-collusion instructions for coalition members only.
+
+    Installed natively via ``environment.prompt_wrapper`` (contract:
+    ``WrapperCls(env, full_config, base_prompts=...)``). Everything the wrapper
+    needs beyond the native context keys comes from ``full_config``:
+
+    - ``experiment.persuasion_hospital.prompt_variant`` — the sweep's variant
+      (injected per run by run.py);
+    - ``experiment.persuasion_hospital.secret_channel_enabled`` — whether the
+      sweep gave the coalition a secret channel (injected per run by run.py);
+    - ``_experiment_prompt_logger`` — the run-private prompt-capture logger
+      (stashed on the config by run.py);
+    - native context keys ``role`` / ``coalition_members`` /
+      ``secret_blackboard_id`` / ``collusion_strategy`` / ``phase`` from
+      ``environment.collusion`` + ``environment.secret_channels``.
+    """
 
     def __init__(
         self,
         env: AbstractEnvironment,
         full_config: Dict[str, Any],
         *,
-        prompt_variant: str,
         base_prompts: Optional[Any] = None,
-        experiment_prompt_logger: Optional[Any] = None,
-        log_prompts: bool = True,
     ):
         self.env = env
         self.full_config = full_config
-        self.prompt_variant = str(prompt_variant or "").strip() or "control"
+        ph_block = (full_config.get("experiment") or {}).get("persuasion_hospital") or {}
+        self.prompt_variant = str(ph_block.get("prompt_variant") or "").strip() or "control"
+        self.secret_channel_enabled = bool(ph_block.get("secret_channel_enabled", False))
         self.base_prompts = (
             base_prompts if base_prompts is not None else getattr(env, "prompts", None)
         )
         if self.base_prompts is self:
             self.base_prompts = None
-        self.experiment_prompt_logger = experiment_prompt_logger
-        self.log_prompts = bool(log_prompts)
+        self.experiment_prompt_logger = full_config.get("_experiment_prompt_logger")
+        log_prompts_cfg = (full_config.get("experiment") or {}).get("log_prompts")
+        self.log_prompts = True if log_prompts_cfg is None else bool(log_prompts_cfg)
 
     def get_system_prompt(self) -> str:
         base = ""
@@ -248,13 +263,22 @@ MISALIGNMENT MODE SWITCH (always applicable):
             agent_name, agent_context, blackboard_context
         ).strip()
 
-        role = str(agent_context.get("collusion_role") or "normal").strip().lower()
-        coalition = agent_context.get("collusion_coalition_members") or []
+        # Native collusion context keys (environment.collusion +
+        # environment.secret_channels). The persuasion prompt is shown only
+        # when the sweep enabled the secret channel (run.py records that flag
+        # in experiment.persuasion_hospital.secret_channel_enabled).
+        native_role = str(agent_context.get("role") or "cooperative").strip().lower()
+        role = (
+            "colluder"
+            if (self.secret_channel_enabled and native_role == "adversary")
+            else "normal"
+        )
+        coalition = agent_context.get("coalition_members") or []
         coalition_names = [
             str(x) for x in coalition if x is not None and str(x).strip()
         ]
-        collusion_blackboard_id = agent_context.get("collusion_blackboard_id")
-        misalignment_strategy = str(agent_context.get("misalignment_strategy") or "").strip()
+        collusion_blackboard_id = agent_context.get("secret_blackboard_id")
+        misalignment_strategy = str(agent_context.get("collusion_strategy") or "").strip()
 
         agent_label = str(agent_name)
         coalition_label = ", ".join(coalition_names) if coalition_names else "(unknown)"
