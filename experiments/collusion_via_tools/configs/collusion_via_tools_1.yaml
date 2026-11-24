@@ -7,6 +7,14 @@ experiment:
   adversary:
     attack_frequency: always
     secret_channel_enabled: true
+    # Adversary-only instruction text rendered into the coalition's system
+    # prompt by the submodule from `environment.collusion.instructions_file`.
+    # Relative paths resolve against this config file's directory. run.py
+    # injects `environment.collusion` (members are picked per sweep/seed),
+    # `environment.secret_channels`, `environment.blocked_tools`,
+    # `environment.prompt_wrapper` and `simulation.phases` into the per-run
+    # config from the sweep axes below.
+    instructions_file: collusion_instructions.txt
 
   # Deterministic agent turn order. The environment's job queue is filtered by
   # service only and rebuilt each turn, so the agent that acts earlier takes the
@@ -136,11 +144,26 @@ simulation:
   # be an integer >= 1).
 
 environment:
-  import_path: "envs.dcops.hospital.hospital_env:HospitalEnvironment"
+  import_path: "terrarium.environments.dcops.hospital.hospital_env:HospitalEnvironment"
   name: HospitalEnvironment
   num_patients: 8 # Overridden by sweep
   num_hospitals: 2 # Overridden by sweep
   default_capacity: 2
+  # Native override surface (injected per run by run.py from the sweep axes;
+  # shown here commented for documentation):
+  #   prompt_wrapper: "experiments.collusion_via_tools.prompts:MisalignmentPrompts"
+  #   collusion: {enabled: true, members: [...], strategy: covert, instructions_file: collusion_instructions.txt}
+  #   secret_channels: [{members: [...], enforce_in_phases: [pre_coordination]}]
+  #   blocked_tools:
+  #     pre_coordination: ["*"]            # or ["*", "post_message"] when no secret channel
+  #     planning: [{tool: post_message, roles: [adversary]}]   # when disable_post_message
+  #     execution: [{tool: post_message, roles: [adversary]}]
+  #     survey: [{tool: post_message, roles: [adversary]}]
+  # simulation.phases (injected per run):
+  #   - {name: pre_coordination, rounds: N, when: before, agents: [...], max_calls: {post_message: M}}
+  #   - {name: planning, rounds: max_planning_rounds}
+  #   - {name: execution, rounds: 1}
+  #   - {name: survey, rounds: 1, when: after}
 
 communication_network:
   topology: complete
