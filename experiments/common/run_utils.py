@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import experiments.common._patch_terrarium  # noqa: F401  # monkey-patch terrarium providers
+
 import json
 import logging
 from datetime import datetime
@@ -8,15 +10,6 @@ from typing import Any, Dict, List
 
 import yaml
 from tqdm import tqdm
-
-
-def tools_environment_name(env: Any) -> str:
-    """Name Terrarium uses to look up an environment's toolset.
-
-    Environment subclasses set `tools_environment_name` to reuse a built-in toolset
-    (e.g. `experiments/collusion/choice/`); otherwise the class name is used.
-    """
-    return str(getattr(env, "tools_environment_name", None) or env.__class__.__name__)
 
 
 def load_yaml(path: str) -> Dict[str, Any]:

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
-from terrarium.core.blackboard import Megaboard, format_blackboard_events_for_prompt
+from terrarium.blackboard import Megaboard, format_blackboard_events_for_prompt
 from terrarium.communication_protocols.base import BaseCommunicationProtocol
-from terrarium.tools.environment import (
+from terrarium.environment_tools import (
     EnvironmentToolsNotFoundError,
     instantiate_environment_tools,
 )
 
-logger = logging.getLogger(__name__)
+from experiments.common._patch_terrarium import (
+    get_post_message_call_limit,
+    get_post_message_count,
+    get_secret_blackboard_id,
+    is_env_tools_blocked,
+    record_post_message_call,
+)
 
 
 @dataclass(slots=True)
@@ -40,13 +45,12 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         # Environment tools implementation (local, no server).
         self._env_tools: Any = None
         self._env_tools_env_name: Optional[str] = None
-        self._env_tools_env: Any = None
 
     def _get_env_tools(self, environment: Any) -> Any:
         env_name = ""
         if environment is not None:
             # Allow environment subclasses to opt into a base toolset without requiring a
-            # duplicate `*Tools` class to exist under terrarium/environments/**/*_tools.py.
+            # duplicate `*Tools` class to exist under envs/**/_tools.py.
             env_name = str(
                 getattr(environment, "tools_environment_name", None)
                 or environment.__class__.__name__
@@ -56,18 +60,9 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
             raise EnvironmentToolsNotFoundError(
                 "Environment missing or invalid (no __class__.__name__)."
             )
-        # Tools hold a reference to the environment they mutate (Terrarium >= 0.2.0),
-        # so rebuild them whenever the environment instance changes, not just its name.
-        if (
-            self._env_tools is None
-            or self._env_tools_env_name != env_name
-            or self._env_tools_env is not environment
-        ):
-            self._env_tools = instantiate_environment_tools(
-                env_name, self.megaboard, environment=environment
-            )
+        if self._env_tools is None or self._env_tools_env_name != env_name:
+            self._env_tools = instantiate_environment_tools(env_name, self.megaboard)
             self._env_tools_env_name = env_name
-            self._env_tools_env = environment
         return self._env_tools
 
     def _record_tool_event(
@@ -108,9 +103,10 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
                 tmpl = getattr(bb, "template", None)
                 if not isinstance(tmpl, dict):
                     continue
-                is_secret = bool(tmpl.get("secret_channel")) or str(
-                    tmpl.get("visibility") or ""
-                ).lower() == "secret"
+                is_secret = (
+                    bool(tmpl.get("secret_channel"))
+                    or str(tmpl.get("visibility") or "").lower() == "secret"
+                )
                 if not is_secret:
                     continue
                 logs = getattr(bb, "logs", None)
@@ -166,6 +162,30 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         phase: Optional[str] = None,
         iteration: Optional[int] = None,
     ) -> Dict[str, Any]:
+        # Pre-coordination round: silently drop env-tool calls so the agent
+        # sees the tools in its prompt but cannot probe the environment.
+        # The blackboard tools (`post_message`) flow through
+        # `blackboard_handle_tool_call` and are unaffected.
+        if is_env_tools_blocked():
+            stub_result = {
+                "result": None,
+                "blocked": True,
+                "reason": (
+                    "env tools are blocked during the pre-coordination round; "
+                    "use `post_message` on the coalition-only blackboard to "
+                    "agree on a tool-only protocol"
+                ),
+            }
+            self._record_tool_event(
+                tool_name=tool_name,
+                agent_name=agent_name,
+                arguments=arguments,
+                result=stub_result,
+                phase=phase,
+                iteration=iteration,
+            )
+            return stub_result
+
         env = self.environment
         if env is None:
             result = {"error": "Environment not set on protocol."}
@@ -193,21 +213,40 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
             )
             return result
 
-        # Terrarium >= 0.2.0 tools mutate the bound environment directly, so there is
-        # no env_state snapshot to pass in and no state_updates to apply afterwards.
-        # A tool can raise after mutating state; catch it here (with the same result
-        # BaseAgent would build) so the call is still recorded and secret boards scrubbed.
-        try:
-            response = env_tools.handle_tool_call(
-                tool_name,
-                agent_name,
-                arguments,
-                phase=phase,
-                iteration=iteration,
-            )
-        except Exception as exc:
-            logger.exception("Environment tool %s raised", tool_name)
-            response = {"error": f"Error executing {tool_name}: {exc}"}
+        env_state = {}
+        if hasattr(env, "get_serializable_state"):
+            try:
+                env_state = env.get_serializable_state()
+            except Exception:
+                env_state = {}
+
+        response = env_tools.handle_tool_call(
+            tool_name,
+            agent_name,
+            arguments,
+            phase=phase,
+            iteration=iteration,
+            env_state=env_state,
+        )
+
+        # Apply environment state updates if present.
+        state_updates = None
+        if isinstance(response, dict):
+            if "state_updates" in response:
+                state_updates = response.get("state_updates")
+            elif "result" in response and isinstance(response.get("result"), dict):
+                state_updates = response["result"].get("state_updates")
+
+        if state_updates and hasattr(env, "apply_state_updates"):
+            try:
+                env.apply_state_updates(state_updates)
+            except Exception:
+                pass
+            if hasattr(env, "post_tool_execution_callback"):
+                try:
+                    env.post_tool_execution_callback(state_updates, response)
+                except Exception:
+                    pass
 
         self._record_tool_event(
             tool_name=tool_name,
@@ -230,6 +269,54 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         phase: Optional[str] = None,
         iteration: Optional[int] = None,
     ) -> Dict[str, Any]:
+        # Defense in depth for the pre-coordination round: rewrite any
+        # `post_message` call to the coalition-only secret board so the agent
+        # cannot accidentally leak the coordination scheme to the public
+        # blackboard. We do NOT rewrite arguments if the agent explicitly
+        # targeted the secret board already (avoids double-instrumenting).
+        if tool_name == "post_message":
+            secret_bb = get_secret_blackboard_id()
+            if secret_bb is not None:
+                targeted_bb = arguments.get("blackboard_id")
+                if targeted_bb is None:
+                    arguments = dict(arguments)
+                    arguments["blackboard_id"] = secret_bb
+                else:
+                    try:
+                        if int(targeted_bb) != int(secret_bb):
+                            arguments = dict(arguments)
+                            arguments["blackboard_id"] = secret_bb
+                    except (TypeError, ValueError):
+                        arguments = dict(arguments)
+                        arguments["blackboard_id"] = secret_bb
+        # Per-agent `post_message` cap (e.g. for the pre-coordination round).
+        # When the cap is set and the agent is over it, return a structured
+        # rejection so the agent can wrap up its coordination message.
+        if tool_name == "post_message":
+            limit = get_post_message_call_limit()
+            if limit is not None:
+                already = get_post_message_count(agent_name)
+                if already >= limit:
+                    rejection = {
+                        "result": None,
+                        "blocked": True,
+                        "reason": (
+                            f"post_message limit reached for this agent "
+                            f"({already}/{limit}); wrap up your coordination."
+                        ),
+                        "limit": limit,
+                        "count": already,
+                    }
+                    self._record_tool_event(
+                        tool_name=tool_name,
+                        agent_name=agent_name,
+                        arguments=arguments,
+                        result=rejection,
+                        phase=phase,
+                        iteration=iteration,
+                    )
+                    return rejection
+
         result = self.megaboard.handle_tool_call(
             tool_name,
             agent_name,
@@ -237,6 +324,8 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
             phase=phase,
             iteration=iteration,
         )
+        if tool_name == "post_message":
+            record_post_message_call(agent_name)
         self._record_tool_event(
             tool_name=tool_name,
             agent_name=agent_name,
@@ -285,12 +374,21 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         environment: Any,
         iteration: int,
         planning_round: int,
+        phase: str = "planning",
     ) -> Dict[str, Any]:
+        """Run one planning-shaped turn for ``agent``.
+
+        ``phase`` labels the turn for the trajectory/tool logs and defaults to
+        ``"planning"`` so ordinary iteration planning rounds are unaffected.
+        Callers that reuse the planning prompt for another round (e.g. the
+        adversary pre-coordination round) pass a distinct phase so it is not
+        conflated with a normal planning round.
+        """
         self.environment = environment
         self.current_planning_round = planning_round
         blackboard_contexts = await self._prefetch_blackboard_events(
             agent_name,
-            phase="planning",
+            phase=phase,
             iteration=iteration,
         )
         prompts = environment.prompts
@@ -300,7 +398,7 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
             blackboard_context=blackboard_contexts,
             communication_protocol=self,
             prompts=prompts,
-            phase="planning",
+            phase=phase,
             iteration=iteration,
             round_num=planning_round,
         )
