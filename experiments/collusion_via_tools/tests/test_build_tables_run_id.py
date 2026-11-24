@@ -1,0 +1,220 @@
+"""Regression tests for run_id parsing in ``plots/build_tables.py``.
+
+Focus: ``_infer_run_fields`` must accept the post_message restriction suffixes
+emitted by ``collusion_via_tools.run._build_run_id`` (``__nopm`` and
+``__precoord``) while keeping the legacy ``__strat{...}`` form (without a
+suffix) and the unsuffixed form parsing exactly as before.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from experiments.collusion_via_tools.plots.build_tables import (
+    _RUN_ID_RE_V2,
+    _infer_run_fields,
+)
+
+# Base run_id template mirroring run._build_run_id (V2 form):
+#   {model}__{sweep}__topo{T}__agents{N}_patients{P}_adv{A}_{role}_seed{S}
+BASE = "qwen__sweepA__topofully_connected__agents5_patients4_adv2_{role}_seed7{suffix}"
+
+
+def _infer(run_id: str) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return _infer_run_fields(run_dir, {"run_id": run_id})
+
+
+def _infer_cfg(run_id: str, run_config: dict) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return _infer_run_fields(run_dir, {"run_id": run_id, **run_config})
+
+
+class RunIdParsingTests(unittest.TestCase):
+    def assert_common_fields(self, fields: dict, *, role: str) -> None:
+        self.assertEqual(fields.get("model_label"), "qwen")
+        self.assertEqual(fields.get("sweep_name"), "sweepA")
+        self.assertEqual(fields.get("topology"), "fully_connected")
+        self.assertEqual(fields.get("requested_num_agents"), 5)
+        self.assertEqual(fields.get("num_agents"), 5)
+        self.assertEqual(fields.get("num_patients"), 4)
+        self.assertEqual(fields.get("requested_adversary_count"), 2)
+        self.assertEqual(fields.get("adversary_count"), 2)
+        self.assertEqual(fields.get("target_role"), role)
+        self.assertEqual(fields.get("seed"), 7)
+
+    def test_plain_unsuffixed_id(self) -> None:
+        fields = _infer(BASE.format(role="Patient", suffix=""))
+        self.assert_common_fields(fields, role="Patient")
+        self.assertFalse(fields.get("disable_post_message"))
+        self.assertFalse(fields.get("post_message_restricted"))
+        self.assertFalse(fields.get("pre_coordination_round"))
+
+    def test_nopm_suffix(self) -> None:
+        fields = _infer(BASE.format(role="Patient", suffix="__nopm"))
+        self.assert_common_fields(fields, role="Patient")
+        self.assertTrue(fields.get("disable_post_message"))
+        self.assertTrue(fields.get("post_message_restricted"))
+        self.assertFalse(fields.get("pre_coordination_round"))
+
+    def test_precoord_suffix(self) -> None:
+        fields = _infer(BASE.format(role="Patient", suffix="__precoord"))
+        self.assert_common_fields(fields, role="Patient")
+        self.assertFalse(fields.get("disable_post_message"))
+        self.assertFalse(fields.get("post_message_restricted"))
+        self.assertTrue(fields.get("pre_coordination_round"))
+
+    def test_nopm_precoord_combined_suffix(self) -> None:
+        fields = _infer(BASE.format(role="Patient", suffix="__nopm__precoord"))
+        self.assert_common_fields(fields, role="Patient")
+        self.assertTrue(fields.get("disable_post_message"))
+        self.assertTrue(fields.get("post_message_restricted"))
+        self.assertTrue(fields.get("pre_coordination_round"))
+
+    def test_legacy_strat_segment_without_suffix(self) -> None:
+        run_id = (
+            "qwen__sweepA__topofully_connected__stratdeception__"
+            "agents5_patients4_adv2_Patient_seed7"
+        )
+        fields = _infer(run_id)
+        self.assert_common_fields(fields, role="Patient")
+        self.assertFalse(fields.get("disable_post_message"))
+        self.assertFalse(fields.get("post_message_restricted"))
+        self.assertFalse(fields.get("pre_coordination_round"))
+
+    def test_role_with_underscores_unsuffixed(self) -> None:
+        fields = _infer(BASE.format(role="Resource_Provisioner", suffix=""))
+        self.assert_common_fields(fields, role="Resource_Provisioner")
+        self.assertFalse(fields.get("disable_post_message"))
+
+    def test_role_with_underscores_suffixed(self) -> None:
+        fields = _infer(BASE.format(role="Resource_Provisioner", suffix="__nopm"))
+        self.assert_common_fields(fields, role="Resource_Provisioner")
+        self.assertTrue(fields.get("disable_post_message"))
+
+    def test_old_cut_after_round_suffix_no_longer_matches(self) -> None:
+        run_id = BASE.format(role="Patient", suffix="__cut_after_r1")
+        # The V2 regex intentionally drops the legacy `__cut_after_r{N}` suffix:
+        # old outputs are not supported any more.
+        self.assertIsNone(_RUN_ID_RE_V2.match(run_id))
+        fields = _infer(run_id)
+        self.assertIsNone(fields.get("disable_post_message"))
+        self.assertIsNone(fields.get("post_message_restricted"))
+        self.assertIsNone(fields.get("pre_coordination_round"))
+
+    def test_v1_id_still_parses_without_suffix_fields(self) -> None:
+        # V1 form (run._build_run_id_v1): no topo/patients segment, no suffix.
+        run_id = "qwen__sweepA__agents5_adv2_Resource_Provisioner_seed7"
+        fields = _infer(run_id)
+        self.assertEqual(fields.get("model_label"), "qwen")
+        self.assertEqual(fields.get("sweep_name"), "sweepA")
+        self.assertEqual(fields.get("num_agents"), 5)
+        self.assertEqual(fields.get("adversary_count"), 2)
+        self.assertEqual(fields.get("target_role"), "Resource_Provisioner")
+        self.assertEqual(fields.get("seed"), 7)
+        self.assertFalse(fields.get("disable_post_message"))
+        self.assertFalse(fields.get("post_message_restricted"))
+        self.assertFalse(fields.get("pre_coordination_round"))
+
+
+class CountedPrecoordRunIdTests(unittest.TestCase):
+    """The round count is now encoded in `run_id` as `__precoord<N>`."""
+
+    def test_counted_suffix_sets_round_count(self) -> None:
+        for n in (1, 2, 5):
+            with self.subTest(n=n):
+                fields = _infer(BASE.format(role="Patient", suffix=f"__precoord{n}"))
+                self.assertTrue(fields.get("pre_coordination_round"))
+                self.assertEqual(fields.get("pre_coordination_rounds"), n)
+                self.assertEqual(fields.get("pre_coordination_rounds_effective"), n)
+
+    def test_legacy_count_less_defaults_to_one(self) -> None:
+        fields = _infer(BASE.format(role="Patient", suffix="__precoord"))
+        self.assertTrue(fields.get("pre_coordination_round"))
+        self.assertEqual(fields.get("pre_coordination_rounds"), 1)
+
+    def test_nopm_counted_suffix(self) -> None:
+        fields = _infer(BASE.format(role="Patient", suffix="__nopm__precoord2"))
+        self.assertTrue(fields.get("disable_post_message"))
+        self.assertTrue(fields.get("post_message_restricted"))
+        self.assertTrue(fields.get("pre_coordination_round"))
+        self.assertEqual(fields.get("pre_coordination_rounds"), 2)
+
+    def test_run_config_wins_over_run_id_count(self) -> None:
+        fields = _infer_cfg(
+            BASE.format(role="Patient", suffix="__precoord2"),
+            {
+                "pre_coordination_round": True,
+                "pre_coordination_rounds": 5,
+                "pre_coordination_rounds_effective": 5,
+            },
+        )
+        self.assertEqual(fields.get("pre_coordination_rounds"), 5)
+
+
+class TreatmentMetadataTests(unittest.TestCase):
+    def test_configured_and_effective_counts_from_run_config(self) -> None:
+        rid = BASE.format(role="Patient", suffix="__precoord")
+        fields = _infer_cfg(
+            rid,
+            {
+                "pre_coordination_round": True,
+                "pre_coordination_rounds": 2,
+                "pre_coordination_rounds_effective": 2,
+            },
+        )
+        self.assertTrue(fields.get("pre_coordination_round"))
+        self.assertEqual(fields.get("pre_coordination_rounds"), 2)
+        self.assertEqual(fields.get("pre_coordination_rounds_effective"), 2)
+
+    def test_legacy_precoord_run_defaults_to_one_round(self) -> None:
+        rid = BASE.format(role="Patient", suffix="__precoord")
+        fields = _infer_cfg(rid, {"pre_coordination_round": True})
+        self.assertEqual(fields.get("pre_coordination_rounds"), 1)
+        self.assertEqual(fields.get("pre_coordination_rounds_effective"), 1)
+
+    def test_legacy_benign_precoord_effective_rounds_zero(self) -> None:
+        # Legacy benign run with the phase flag on but no effective field: the
+        # actual coalition was empty, so no pre-coordination round executed.
+        rid = BASE.format(role="Patient", suffix="__precoord")
+        fields = _infer_cfg(
+            rid,
+            {"pre_coordination_round": True, "adversaries": []},
+        )
+        self.assertEqual(fields.get("pre_coordination_rounds"), 1)
+        self.assertEqual(fields.get("pre_coordination_rounds_effective"), 0)
+
+    def test_legacy_benign_roles_fallback_effective_rounds_zero(self) -> None:
+        rid = BASE.format(role="Patient", suffix="__precoord")
+        fields = _infer_cfg(
+            rid,
+            {
+                "pre_coordination_round": True,
+                "roles": {"A": "cooperative", "B": "cooperative"},
+            },
+        )
+        self.assertEqual(fields.get("pre_coordination_rounds_effective"), 0)
+
+    def test_disabled_phase_has_zero_effective_rounds(self) -> None:
+        rid = BASE.format(role="Patient", suffix="")
+        fields = _infer_cfg(
+            rid,
+            {
+                "pre_coordination_round": False,
+                "pre_coordination_rounds": 2,
+                "pre_coordination_rounds_effective": 0,
+            },
+        )
+        self.assertFalse(fields.get("pre_coordination_round"))
+        self.assertEqual(fields.get("pre_coordination_rounds"), 2)
+        self.assertEqual(fields.get("pre_coordination_rounds_effective"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
