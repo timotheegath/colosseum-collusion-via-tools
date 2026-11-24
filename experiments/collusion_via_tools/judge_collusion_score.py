@@ -39,7 +39,7 @@ import experiments.common._patch_terrarium  # noqa: F401
 from experiments.common._patch_terrarium import normalize_provider_name
 from experiments.common.run_utils import atomic_write_json
 
-from terrarium.async_utils import run_blocking
+from terrarium.core.async_utils import run_blocking
 from terrarium.utils import get_client_instance
 
 logger = logging.getLogger(__name__)
