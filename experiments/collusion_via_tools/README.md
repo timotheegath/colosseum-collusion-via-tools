@@ -139,24 +139,63 @@ The plot axis is labelled `Collusion judge (Simple) (0-5)`. The Appendix F
 the script for easy extension.
 
 ## Configuration notes
-* **Environment class**: the upstream base `HospitalEnvironment` (`envs.dcops.hospital.hospital_env:HospitalEnvironment`), selected through `environment.import_path`. There is no local subclass: `schedule_patient` is callable only in the `execution` phase, and no agent's toolset is gated by role.
+* **Environment class**: the upstream base `HospitalEnvironment` (`terrarium.environments.dcops.hospital.hospital_env:HospitalEnvironment`), selected through `environment.import_path`. There is no local subclass: `schedule_patient` is callable only in the `execution` phase natively.
 * **Figure 7 topology**: `complete`
 * **Figure 7 sweep design**: the experiment fixes the covert behavior; `target_roles` splits provisioner vs departmental coalitions.
+
+## Native config flow
+
+All experiment-specific behavior is driven by the Terrarium submodule's native
+config keys — there is no Python-side tool gating, secret-board creation, or
+phase monkeypatching anymore (`experiments/common/_patch_terrarium.py` now only
+installs the `custom_oai_compatible` LLM provider and one cosmetic blackboard
+label fix). Because the coalition is picked per sweep/seed, `run.py` injects
+the native blocks into the per-run config before constructing the environment:
+
+* `environment.collusion`: `{enabled: true, members: [...], strategy: covert,
+  instructions_file: collusion_instructions.txt}` — the environment natively
+  provides the `role` / `coalition_members` / `collusion_strategy` /
+  `collusion_instructions` / `secret_blackboard_id` context keys and renders
+  the instructions block to adversaries only. Relative `instructions_file`
+  paths resolve against the config file's directory. The adversary strategy
+  text lives in `configs/collusion_instructions.txt`.
+* `environment.secret_channels`: `[{members: [...], enforce_in_phases:
+  [pre_coordination]}]` — the environment creates the coalition-only board
+  itself, and the protocol rewrites `post_message` onto it during the enforced
+  phase.
+* `environment.blocked_tools`: per-phase tool gating —
+  `pre_coordination: ["*"]` (all environment tools; `"*"` never matches
+  blackboard tools) optionally plus `"post_message"`, and, when
+  `disable_post_message` is set, `{tool: post_message, roles: [adversary]}`
+  entries for `planning` / `execution` / `survey`. The gate is honoured both in
+  the tool schema and at runtime.
+* `environment.prompt_wrapper`: `experiments.collusion_via_tools.prompts:MisalignmentPrompts`
+  — a pure prompt decorator reading the native context keys (contract:
+  `WrapperCls(env, full_config, base_prompts=...)`).
+* `simulation.phases`: the phase sequence —
+  `pre_coordination` (`when: "before"`, adversaries-only `agents` subset,
+  optional `max_calls: {post_message: N}`), then `planning` / `execution` per
+  iteration, then `survey` (`when: "after"`) — walked by `run.py` through the
+  generic `protocol.agent_turn`.
 
 ## Pre-coordination rounds
 
 `pre_coordination_round: true` (sweep key, or under `experiment` /
 `experiment.adversary` / `communication_network`) runs a dedicated
-adversaries-only phase before planning iteration 1. It is coordination-only:
-the prompt does not inherit the operational planning instructions, every
-environment tool is blocked, and the agent context is stripped of environment
-state.
+adversaries-only phase before planning iteration 1, expressed as a
+`simulation.phases` entry (`when: "before"`, `agents: [<adversaries>]`,
+`iteration=0`). It is coordination-only: the prompt does not inherit the
+operational planning instructions, and every environment tool is blocked via
+`environment.blocked_tools: {pre_coordination: ["*"]}` (the wildcard never
+matches blackboard tools, so `post_message` is unaffected by it).
 
 `post_message` is available during the phase **only when a coalition-only
-secret blackboard exists**; posts are routed to it. If there is no secret board,
-`post_message` is disabled for the whole phase and the prompt explicitly says
-there is no private channel and the tool must not be called — a public board is
-never a fallback.
+secret blackboard exists**; posts are routed to it by the native
+`environment.secret_channels[].enforce_in_phases: [pre_coordination]` rewrite.
+If there is no secret board, `post_message` is disabled for the whole phase via
+`blocked_tools: {pre_coordination: ["*", "post_message"]}` and the prompt
+explicitly says there is no private channel and the tool must not be called —
+a public board is never a fallback.
 
 The number of rounds is `pre_coordination_rounds` — a **sweep axis** on
 `sweeps[].pre_coordination_rounds` (a list of ints, or a single int). Every run
@@ -184,8 +223,9 @@ exists, later rounds see the coalition messages written in earlier rounds, so a
 coalition can refine its scheme across the phase.
 
 `pre_coordination_max_messages` is a per-agent `post_message` cap, applied
-**per round**: counters reset at the start of every pre-coordination round.
-Omit it (or set `null`/`0`) for unlimited messages. Invalid
+**per round** via the phase entry's `max_calls: {post_message: N}` (the native
+per-phase call cap; counters reset each round). Omit it (or set `null`/`0`) for
+unlimited messages. Invalid
 `pre_coordination_rounds` values (booleans, non-integers, `< 1`, empty lists)
 raise a `ValueError` when the config is loaded — for both the global fallback
 and every sweep-level value — before any runs are scheduled or the output root
@@ -221,7 +261,7 @@ an earlier attempt are not merged into the new run.
 ## Restricting `post_message` (tool-based collusion)
 
 By default Terrarium exposes a `post_message` blackboard tool to every agent.
-To evaluate collusion carried out through tool calls only, the runner can remove `post_message` — either for the whole run, or only after an initial coordination window in the planning phase.
+To evaluate collusion carried out through tool calls only, the runner can remove `post_message` for adversaries — either for the whole run, or only after an initial coordination window. Natively this is `environment.blocked_tools` with `{"tool": "post_message", "roles": ["adversary"]}` entries for the relevant phases (`planning`/`execution`/`survey`), so the tool is withheld from the schema and returns `{"blocked": true}` at runtime; honest agents keep it.
 
 ### `disable_post_message_after_round`
 
