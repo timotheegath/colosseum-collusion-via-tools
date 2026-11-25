@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import experiments.common._patch_terrarium  # noqa: F401  # monkey-patch terrarium providers
-
 import json
 import logging
 from datetime import datetime

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import experiments.common._patch_terrarium  # noqa: F401  # monkey-patch terrarium providers
-from experiments.common._patch_terrarium import normalize_provider_name
-
 import json
 import logging
 import re
@@ -11,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # Use generic client factory to allow model switching via config
+from terrarium.utils import _normalize_provider_name as normalize_provider_name
 from terrarium.utils import get_client_instance
 from terrarium.async_utils import run_blocking
 
