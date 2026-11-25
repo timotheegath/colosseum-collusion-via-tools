@@ -8,7 +8,9 @@ native in Terrarium: the ``openai_compatible`` provider
 default request timeout and request-only ``strip_reasoning_content``.
 Configs therefore use ``provider: openai_compatible`` with the
 ``OPENAI_COMPATIBLE_BASE_URL`` / ``OPENAI_COMPATIBLE_API_KEY`` env vars, and
-the provider dispatch patch (plus its client) is gone from here.
+the provider dispatch patch (plus its client) is gone from here. The
+hospital ``broadcast_message`` rationale label is likewise native in
+Terrarium now (public ``Rationale:`` label), so that patch is gone too.
 
 What remains is the task-local round state that the collusion-via-tools runner
 drives around terrarium's per-phase toolset lookup:
