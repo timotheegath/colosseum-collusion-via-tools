@@ -21,7 +21,7 @@ helpers so the runner can hand the prompt layer the exact per-phase toolset.
 Two phase gates exist:
 
 * ``schedule_patient`` is offered by ``HospitalTools.get_tools`` only when
-  ``phase == "execution"`` (``envs/dcops/hospital/hospital_tools.py``).
+  ``phase == "execution"`` (``terrarium/environments/dcops/hospital/hospital_tools.py``).
 * ``post_message`` is offered by ``ToolsetDiscovery.get_tools_for_blackboard``
   only for the planning phase; the repo patch in
   ``experiments/common/_patch_terrarium.py`` returns ``[]`` when
@@ -51,7 +51,7 @@ _PHASES: Tuple[str, ...] = ("planning", "execution", "survey", "pre_coordination
 
 # Fallback environment toolset, used only when the agent exposes no
 # ``toolset_discovery`` (or the discovery object yields nothing usable).
-# Mirrors ``envs.dcops.hospital.hospital_tools.HospitalTools.get_tools``:
+# Mirrors ``terrarium.environments.dcops.hospital.hospital_tools.HospitalTools.get_tools``:
 # four always-on tools plus ``schedule_patient`` in the execution phase.
 _FALLBACK_ENV_TOOLS_ALWAYS: Tuple[str, ...] = (
     "find_available_slots",

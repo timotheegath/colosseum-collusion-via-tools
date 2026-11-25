@@ -426,7 +426,7 @@ class PreCoordinationIsCoordinationOnlyTests(unittest.TestCase):
     )
 
     def _prompts(self):
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         from experiments.collusion_via_tools.prompts import (
             ProvisionerBlackboardPrompts,

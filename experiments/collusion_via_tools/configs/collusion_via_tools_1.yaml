@@ -133,7 +133,7 @@ simulation:
   # be an integer >= 1).
 
 environment:
-  import_path: "envs.dcops.hospital.hospital_env:HospitalEnvironment"
+  import_path: "terrarium.environments.dcops.hospital.hospital_env:HospitalEnvironment"
   name: HospitalEnvironment
   num_patients: 8 # Overridden by sweep
   num_hospitals: 2 # Overridden by sweep

@@ -12,7 +12,7 @@ import random
 import types
 import unittest
 
-from envs.dcops.hospital.hospital_env import HospitalEnvironment
+from terrarium.environments.dcops.hospital.hospital_env import HospitalEnvironment
 
 from experiments.collusion_via_tools.run import (
     _fixed_agent_order,

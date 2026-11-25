@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, Dict, Optional, Tuple
 
-from envs.abstract_environment import AbstractEnvironment
+from terrarium.environments.abstract_environment import AbstractEnvironment
 
 
 # The signalling carriers the coalition may use, in the order they are listed.
