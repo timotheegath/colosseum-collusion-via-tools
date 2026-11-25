@@ -183,7 +183,7 @@ class ParticipationScopedVisibilityTests(unittest.TestCase):
     SECRET_MARKER = "SECRET-MARKER-SIGNALING-SCHEME"
 
     def _build_megaboard(self):
-        from terrarium.blackboard import Megaboard
+        from terrarium.core.blackboard import Megaboard
 
         megaboard = Megaboard()
         # Board 0: everyone (including the provisioner).

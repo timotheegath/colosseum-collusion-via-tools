@@ -112,7 +112,7 @@ def tool_names_for_phase(agent: Any, env: Any, phase: str) -> List[str]:
     Order is preserved (environment tools first, then blackboard tools). If the
     agent has no ``toolset_discovery`` -- or the discovery object yields no
     tools at all, which happens when an environment subclass is not registered
-    with ``terrarium.environment_tools`` -- this falls back to the known Hospital
+    with ``terrarium.tools.environment`` -- this falls back to the known Hospital
     toolset for ``phase``.
     """
     discovery = getattr(agent, "toolset_discovery", None)
