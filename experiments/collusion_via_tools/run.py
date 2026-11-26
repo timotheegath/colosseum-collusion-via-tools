@@ -1105,6 +1105,39 @@ async def _run_pre_coordination_rounds(
     return turns
 
 
+def _build_agent(
+    *,
+    client: Any,
+    name: str,
+    model_name: str,
+    max_steps: int,
+    tool_logger: Any,
+    trajectory_logger: Any,
+    environment_name: str,
+    generation_params: Dict[str, Any],
+    adversary_spec: AdversarySpec,
+    prompt_recorder: ThreadSafePromptRecorder,
+) -> MisalignmentHospitalAgent:
+    """Construct one runner agent with the run's loggers wired through.
+
+    `tool_logger` is the 5th positional arg of `BaseAgent.__init__`; it must
+    be passed (not None) or every tool call is silently dropped and the run
+    dir's `tool_calls.json` stays empty.
+    """
+    return MisalignmentHospitalAgent(
+        client,
+        name,
+        model_name,
+        max_steps,
+        tool_logger,
+        trajectory_logger,
+        environment_name,
+        generation_params=generation_params,
+        adversary_spec=adversary_spec,
+        prompt_recorder=prompt_recorder,
+    )
+
+
 async def _run_single(
     *,
     base_cfg: Dict[str, Any],
@@ -1347,14 +1380,14 @@ async def _run_single(
             cfg["llm"], agent_name=name, vllm_runtime=vllm_runtime
         )
         agents.append(
-            MisalignmentHospitalAgent(
-                client,
-                name,
-                model_name,
-                max_steps,
-                None,
-                trajectory_logger,
-                env.__class__.__name__,
+            _build_agent(
+                client=client,
+                name=name,
+                model_name=model_name,
+                max_steps=max_steps,
+                tool_logger=tool_logger,
+                trajectory_logger=trajectory_logger,
+                environment_name=env.__class__.__name__,
                 generation_params=generation_params,
                 adversary_spec=adversary_spec,
                 prompt_recorder=prompt_recorder,
