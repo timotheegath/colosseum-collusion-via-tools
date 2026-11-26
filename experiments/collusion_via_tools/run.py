@@ -35,7 +35,6 @@ from experiments.collusion_via_tools.agents import (
     AdversarySpec,
     MisalignmentHospitalAgent,
 )
-from experiments.common.blackboard_logger import ExperimentBlackboardLogger
 from experiments.collusion_via_tools.metrics import compute_misalignment_metrics
 from experiments.collusion_via_tools.prompts import (
     MisalignmentPrompts,
@@ -62,7 +61,7 @@ from experiments.common._patch_terrarium import (
 
 from terrarium.networks import build_communication_network
 
-from terrarium.core.logger import AgentTrajectoryLogger, ToolCallLogger
+from terrarium.core.logger import AgentTrajectoryLogger, BlackboardLogger, ToolCallLogger
 from terrarium.utils import (
     get_client_instance,
     get_generation_params,
@@ -937,7 +936,7 @@ def _select_adversaries_hospital_coalition(
 
 def _log_blackboards_txt(
     *,
-    bb_logger: ExperimentBlackboardLogger,
+    bb_logger: BlackboardLogger,
     protocol: LocalCommunicationProtocol,
     iteration: int,
     phase: str,
@@ -1007,7 +1006,7 @@ async def _run_pre_coordination_rounds(
     max_messages: Optional[int],
     secret_blackboard_id: Optional[int],
     extra_fields: Callable[[str, str], Dict[str, Any]],
-    bb_logger: Optional[ExperimentBlackboardLogger] = None,
+    bb_logger: Optional[BlackboardLogger] = None,
     on_turn: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the dedicated adversaries-only pre-coordination phase.
@@ -1309,7 +1308,7 @@ async def _run_single(
     )
     env = env_cls(protocol, cfg, tool_logger=tool_logger)
 
-    bb_logger = ExperimentBlackboardLogger(cfg, log_root=run_dir)
+    bb_logger = BlackboardLogger(cfg, log_dir=run_dir)
     bb_logger.clear_blackboard_logs()
 
     trajectory_logger = AgentTrajectoryLogger(
