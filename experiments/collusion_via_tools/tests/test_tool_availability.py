@@ -13,9 +13,13 @@ import unittest
 
 from experiments.collusion_via_tools.prompts import MisalignmentPrompts
 from experiments.collusion_via_tools.tool_availability import (
-    PHASE_ENV_TOOLS_BLOCKED,
+    phase_env_tools_blocked,
     phase_tool_map,
     tool_names_for_phase,
+)
+from terrarium.communication_protocols.local import (
+    LocalCommunicationProtocol,
+    PhaseToolPolicy,
 )
 
 
@@ -398,10 +402,15 @@ class _FakeDiscovery:
             for n in self._env.get(phase, [])
         ]
 
-    def get_tools_for_blackboard(self, phase):
+    def get_tools_for_blackboard(
+        self, phase, environment_name="", retrieval_enabled=False, allowed_tools=None
+    ):
+        names = list(self._bb.get(phase, []))
+        if allowed_tools is not None:
+            names = [n for n in names if n in set(allowed_tools)]
         return [
             {"type": "function", "function": {"name": n}}
-            for n in self._bb.get(phase, [])
+            for n in names
         ]
 
 
@@ -462,8 +471,43 @@ class ToolNamesForPhaseTests(unittest.TestCase):
             _ENV_TOOLS + ["post_message"],
         )
 
-    def test_blocked_phase_constant(self) -> None:
-        self.assertEqual(PHASE_ENV_TOOLS_BLOCKED, ("pre_coordination",))
+    def test_blocked_phase_derived_from_active_policy(self) -> None:
+        proto = LocalCommunicationProtocol(config={})
+        # No policy: no phase is blocked.
+        self.assertFalse(phase_env_tools_blocked(proto, "pre_coordination"))
+        self.assertFalse(phase_env_tools_blocked(proto, "planning"))
+        # The pre-coordination policy blocks env tool calls for its phase only.
+        proto.set_phase_policy(
+            "pre_coordination",
+            PhaseToolPolicy(block_environment_tool_calls=True),
+        )
+        self.assertTrue(phase_env_tools_blocked(proto, "pre_coordination"))
+        self.assertFalse(phase_env_tools_blocked(proto, "planning"))
+        proto.pop_phase_policy("pre_coordination")
+        self.assertFalse(phase_env_tools_blocked(proto, "pre_coordination"))
+
+    def test_tool_names_honour_active_policy_allowlist(self) -> None:
+        agent = self._agent()
+        env = types.SimpleNamespace(tools_environment_name="HospitalEnvironment")
+        proto = LocalCommunicationProtocol(config={})
+        proto.set_phase_policy(
+            "planning", PhaseToolPolicy(blackboard_tools=set())
+        )
+        # Withheld for the phase with the policy...
+        self.assertEqual(
+            tool_names_for_phase(agent, env, "planning", proto),
+            _ENV_TOOLS,
+        )
+        # ...but the phase default still applies to phases without a policy.
+        self.assertEqual(
+            tool_names_for_phase(agent, env, "pre_coordination", proto),
+            _ENV_TOOLS + ["post_message"],
+        )
+        proto.pop_phase_policy("planning")
+        self.assertEqual(
+            tool_names_for_phase(agent, env, "planning", proto),
+            _ENV_TOOLS + ["post_message"],
+        )
 
 
 if __name__ == "__main__":
