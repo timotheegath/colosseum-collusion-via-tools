@@ -34,12 +34,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-# Apply terrarium patches *before* importing any terrarium symbols.
-import experiments.common._patch_terrarium  # noqa: F401
-from experiments.common._patch_terrarium import normalize_provider_name
 from experiments.common.run_utils import atomic_write_json
 
-from terrarium.async_utils import run_blocking
+from terrarium.core.async_utils import run_blocking
+from terrarium.utils import _normalize_provider_name as normalize_provider_name
 from terrarium.utils import get_client_instance
 
 logger = logging.getLogger(__name__)

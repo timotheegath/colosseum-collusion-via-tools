@@ -2,7 +2,7 @@
 
 These tests exercise the *real* monkey-patch in
 ``experiments.common._patch_terrarium`` (importing the module installs it) and
-`:class:`terrarium.toolset_discovery.ToolsetDiscovery` directly. No network or
+`:class:`terrarium.tools.discovery.ToolsetDiscovery` directly. No network or
 LLM call is involved.
 
 Call-path note (why a :class:`contextvars.ContextVar` is sufficient here):
@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from terrarium.toolset_discovery import ToolsetDiscovery
+from terrarium.tools.discovery import ToolsetDiscovery
 
 from experiments.common._patch_terrarium import (
     is_post_message_disabled,

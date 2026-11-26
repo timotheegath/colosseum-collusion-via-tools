@@ -562,7 +562,7 @@ class BlackboardPostMessageCapTests(unittest.TestCase):
 
     def _proto(self):
         from experiments.common.local_protocol import LocalCommunicationProtocol
-        from terrarium.blackboard import Megaboard
+        from terrarium.core.blackboard import Megaboard
 
         proto = LocalCommunicationProtocol(config={})
         proto.megaboard = Megaboard()
@@ -778,7 +778,7 @@ class BlackboardPostMessageRewriteTests(unittest.TestCase):
 
     def _proto(self):
         from experiments.common.local_protocol import LocalCommunicationProtocol
-        from terrarium.blackboard import Megaboard
+        from terrarium.core.blackboard import Megaboard
 
         proto = LocalCommunicationProtocol(config={})
 
@@ -1017,7 +1017,7 @@ class PostMessageAvailableDuringPreCoordination(unittest.TestCase):
     """
 
     def _discovery(self):
-        from terrarium.toolset_discovery import ToolsetDiscovery
+        from terrarium.tools.discovery import ToolsetDiscovery
 
         # The wrapper never reads ``self``; a plain instance mirrors the real
         # call shape and keeps the test hermetic.
@@ -1534,7 +1534,7 @@ class TrajectoryRerunResetTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from terrarium.logger import AgentTrajectoryLogger
+        from terrarium.core.logger import AgentTrajectoryLogger
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

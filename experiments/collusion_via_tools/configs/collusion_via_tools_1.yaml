@@ -98,18 +98,18 @@ experiment:
         
 
 
-# `judge_llm:` block: routes the belief judge through the
-# `custom_oai_compatible` provider slot (checked before `experiment.evaluator`).
+# `judge_llm:` block: routes the belief judge through Terrarium's native
+# `openai_compatible` provider (checked before `experiment.evaluator`).
+# Base URL / API key come from OPENAI_COMPATIBLE_BASE_URL /
+# OPENAI_COMPATIBLE_API_KEY in `.env` unless overridden in the block below.
 judge_llm:
-  provider: custom_oai_compatible
-  custom_oai_compatible:
+  provider: openai_compatible
+  openai_compatible:
     model: zai-org/GLM-5.3-Flash   # model id expected by the upstream endpoint
-    # Per-attempt HTTP read timeout (seconds). The default is 60s, which is
-    # NOT enough for this reasoning model: measured wall time for a single
-    # chat completion on the longest coalition prompts was 34s-91s, so a 60s
-    # ceiling timed out requests that the server was still working on.
-    # The judge's output is small but its reasoning trace is not, so it shares
-    # this client's generous timeout.
+    # Per-attempt HTTP read timeout (seconds). With SSE streaming on (the
+    # native default) this applies per-read between chunks, not to total
+    # generation time; the native default is already 180s. The judge's output
+    # is small but its reasoning trace is not, so it shares this timeout.
     request_timeout: 180
     params:
       # 2026-10-25: the judge previously ran with a 512-token cap. 40 of 438
@@ -119,10 +119,7 @@ judge_llm:
       # 2048.
       max_tokens: 2048
       temperature: 0.0
-      # GLM-5.3 honours only `low` and `high` for `reasoning_effort`; any other
-      # value (e.g. `medium`) is silently mapped to `max` by the chat template,
-      # which is the default and therefore a no-op. `high` is set here (the
-      # faithful middle setting for the requested "medium" effort).
+      # Forwarded to the endpoint as the Responses API `reasoning.effort`.
       reasoning_effort: high
 
 simulation:
@@ -136,7 +133,7 @@ simulation:
   # be an integer >= 1).
 
 environment:
-  import_path: "envs.dcops.hospital.hospital_env:HospitalEnvironment"
+  import_path: "terrarium.environments.dcops.hospital.hospital_env:HospitalEnvironment"
   name: HospitalEnvironment
   num_patients: 8 # Overridden by sweep
   num_hospitals: 2 # Overridden by sweep
@@ -151,15 +148,15 @@ communication_network:
 llm_models:
   - label: modal/glm5.3-flash
     llm:
-      provider: custom_oai_compatible
-      custom_oai_compatible:
+      provider: openai_compatible
+      openai_compatible:
         model: zai-org/GLM-5.3-Flash
-        # Per-attempt HTTP read timeout (seconds). The default is 60s, which
-        # is NOT enough for this reasoning model: a single chat completion on
-        # the longest coalition prompts measured 34s-91s wall time, so a 60s
-        # ceiling timed out requests the server was still working on. The
-        # client POSTs non-streamed, so this timeout caps TOTAL generation
-        # time, not network inactivity.
+        # Per-attempt HTTP read timeout (seconds). With SSE streaming on (the
+        # native default) this applies per-read between chunks, not to total
+        # generation time; the native default is already 180s. A single chat
+        # completion on the longest coalition prompts measured 34s-91s wall
+        # time, so the old 60s ceiling timed out requests the server was still
+        # working on.
         request_timeout: 180
         params:
           # 2026-10-24 incident: a max_tokens cap of 8192 truncated
@@ -174,14 +171,5 @@ llm_models:
           # 32768 is safely within budget.
           max_tokens: 32768
           temperature: 0.7
-          # Reasoning-control levers (GLM-5.3 chat template). GLM-5.3 honours
-          # only `low` and `high` for `reasoning_effort`; any other value
-          # (e.g. `medium`) is silently mapped to `max` by the chat template,
-          # which is the default and therefore a no-op. `high` is the middle
-          # setting (the faithful encoding of the requested "medium" effort;
-          # thinking can never be disabled on GLM-5.3). `clear_thinking` is
-          # available below but left off: it reduces prompt tokens without
-          # shortening the reasoning trace.
+          # Forwarded to the endpoint as the Responses API `reasoning.effort`.
           reasoning_effort: high
-          # chat_template_kwargs:
-          #   clear_thinking: true

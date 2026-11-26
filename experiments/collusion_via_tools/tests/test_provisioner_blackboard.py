@@ -104,7 +104,7 @@ class RealUpstreamIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         cls.base = HospitalPrompts.__new__(HospitalPrompts)
         cls.wrapped = ProvisionerBlackboardPrompts(cls.base)
@@ -183,7 +183,7 @@ class ParticipationScopedVisibilityTests(unittest.TestCase):
     SECRET_MARKER = "SECRET-MARKER-SIGNALING-SCHEME"
 
     def _build_megaboard(self):
-        from terrarium.blackboard import Megaboard
+        from terrarium.core.blackboard import Megaboard
 
         megaboard = Megaboard()
         # Board 0: everyone (including the provisioner).
@@ -220,7 +220,7 @@ class ParticipationScopedVisibilityTests(unittest.TestCase):
     def test_secret_blackboard_visibility_is_participation_scoped(self) -> None:
         """The provisioner always sees the shared board; the coalition-only
         board is visible only to participants (coalition members)."""
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         wrapped = ProvisionerBlackboardPrompts(HospitalPrompts.__new__(HospitalPrompts))
         megaboard = self._build_megaboard()
@@ -260,7 +260,7 @@ class PreCoordinationPhaseRemapTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         cls.base = HospitalPrompts.__new__(HospitalPrompts)
         cls.wrapped = ProvisionerBlackboardPrompts(cls.base)
@@ -356,7 +356,7 @@ class SurveyPhaseRemapTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         cls.base = HospitalPrompts.__new__(HospitalPrompts)
         cls.wrapped = ProvisionerBlackboardPrompts(cls.base)
@@ -468,7 +468,7 @@ class SystemPromptForwardingTests(unittest.TestCase):
         return get_system_prompt(**kwargs)
 
     def test_terrarium_style_call_on_real_hospital_prompts(self) -> None:
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         wrapped = ProvisionerBlackboardPrompts(HospitalPrompts.__new__(HospitalPrompts))
         system_prompt = self._terrarium_style_call(wrapped)
@@ -479,7 +479,7 @@ class SystemPromptForwardingTests(unittest.TestCase):
         self.assertEqual(self._terrarium_style_call(wrapped), "SYSTEM")
 
     def test_direct_kwargs_call_does_not_raise(self) -> None:
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         wrapped = ProvisionerBlackboardPrompts(HospitalPrompts.__new__(HospitalPrompts))
         system_prompt = wrapped.get_system_prompt(
@@ -517,7 +517,7 @@ class SystemPromptForwardingTests(unittest.TestCase):
         """The non-benign stack (MisalignmentPrompts on top) must keep working."""
         import types
 
-        from envs.dcops.hospital.hospital_prompts import HospitalPrompts
+        from terrarium.environments.dcops.hospital.hospital_prompts import HospitalPrompts
 
         wrapped = ProvisionerBlackboardPrompts(HospitalPrompts.__new__(HospitalPrompts))
         prompts = MisalignmentPrompts(types.SimpleNamespace(), {}, base_prompts=wrapped)
