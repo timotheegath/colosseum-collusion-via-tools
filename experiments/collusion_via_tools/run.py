@@ -1885,6 +1885,24 @@ async def _run_single(
     }
 
 
+def _apply_experiment_tag(cfg: Dict[str, Any]) -> None:
+    """Derive `simulation.tags[0]` from `experiment.tag` when tags are unset.
+
+    `simulation.tags[0]` names the legacy `logs/<env>/<tag_model>/...` log
+    subdirectory (see terrarium's `get_tag_model_subdir`); without it the tag
+    falls back to "unknown" and log dirs read `logs/HospitalEnvironment/
+    unknown_<model>/...` even though the experiment declares `experiment.tag`.
+    Mirrors what terrarium's examples/base_main.py does for CLI arms. Existing
+    `simulation.tags` always win.
+    """
+    simulation = cfg.setdefault("simulation", {})
+    if simulation.get("tags"):
+        return
+    tag = (cfg.get("experiment") or {}).get("tag")
+    if tag:
+        simulation["tags"] = [str(tag)]
+
+
 async def run_from_config(
     config_path: str,
     *,
@@ -1901,6 +1919,10 @@ async def run_from_config(
     _resolve_pre_coordination_rounds(cfg)
     exp = cfg.get("experiment") or {}
     max_concurrent_runs = max_concurrent_runs or int(exp.get("max_concurrent_runs", 1))
+
+    # Derive `simulation.tags` from `experiment.tag` so legacy log dirs are
+    # named after the experiment instead of "unknown" (see _apply_experiment_tag).
+    _apply_experiment_tag(cfg)
 
     models = cfg.get("llm_models") or []
     sweeps = exp.get("sweeps") or []
