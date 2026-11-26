@@ -1263,6 +1263,34 @@ class _FakePreCoordProtocol:
         self.counts_before = []
         self.pm_disabled = []
 
+    async def agent_turn(
+        self,
+        agent,
+        agent_name,
+        agent_context,
+        environment,
+        iteration,
+        *,
+        phase,
+        round_num=None,
+        phase_config=None,
+    ):
+        # Mirror LocalCommunicationProtocol.agent_turn: the pre-coordination
+        # phase is planning-shaped, and a failed turn is returned (not raised)
+        # so the walk records an error entry and continues.
+        try:
+            return await self.agent_planning_turn(
+                agent,
+                agent_name,
+                agent_context,
+                environment,
+                iteration,
+                planning_round=round_num if round_num is not None else 1,
+                phase=phase,
+            )
+        except Exception as exc:
+            return exc
+
     async def agent_planning_turn(
         self,
         agent,
@@ -1384,13 +1412,12 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
 
         # Round metadata is passed to both the environment and the turn call.
         self.assertEqual([c["planning_round"] for c in proto.calls], [1, 1, 2, 2])
+        # run_phase_entries passes the round to build_agent_context as
+        # round_number; the pre_coordination_* labels are injected by the
+        # runner's build_turn hook (asserted via agent_context below).
         self.assertEqual(
-            [c["pre_coordination_round"] for c in env.context_calls],
+            [c["round_number"] for c in env.context_calls],
             [1, 1, 2, 2],
-        )
-        self.assertEqual(
-            [c["pre_coordination_rounds"] for c in env.context_calls],
-            [2, 2, 2, 2],
         )
         # One blackboard snapshot per completed round.
         self.assertEqual([c["planning_round"] for c in bb_calls], [1, 2])
@@ -1473,6 +1500,16 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
         )
 
         class _BoomProtocol:
+            async def agent_turn(self, agent, agent_name, agent_context, environment, iteration, *, phase, round_num=None, phase_config=None):
+                try:
+                    return await self.agent_planning_turn(
+                        agent, agent_name, agent_context, environment, iteration,
+                        planning_round=round_num if round_num is not None else 1,
+                        phase=phase,
+                    )
+                except Exception as exc:
+                    return exc
+
             async def agent_planning_turn(self, *args, **kwargs):
                 raise RuntimeError("boom")
 

@@ -360,6 +360,48 @@ class LocalCommunicationProtocol(BaseCommunicationProtocol):
         )
         return blackboard_id
 
+    async def agent_turn(
+        self,
+        agent: Any,
+        agent_name: str,
+        agent_context: Any,
+        environment: Any,
+        iteration: int,
+        *,
+        phase: str,
+        round_num: Optional[int] = None,
+        phase_config: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Generic per-phase turn used by terrarium.utils.run_phase_entries.
+
+        Dispatches on the phase: "survey" goes to agent_survey_turn,
+        "execution" to agent_execution_turn, and every other phase (planning,
+        pre_coordination, ...) to agent_planning_turn with the round number and
+        the phase label. If the turn raises, the exception is returned as the
+        turn result so run_phase_entries keeps walking and the caller's on_turn
+        hook can record an error entry (mirrors the runners' per-turn try/except).
+        """
+        try:
+            if phase == "survey":
+                return await self.agent_survey_turn(
+                    agent, agent_name, agent_context, environment, iteration
+                )
+            if phase == "execution":
+                return await self.agent_execution_turn(
+                    agent, agent_name, agent_context, environment, iteration
+                )
+            return await self.agent_planning_turn(
+                agent,
+                agent_name,
+                agent_context,
+                environment,
+                iteration,
+                planning_round=int(round_num) if round_num is not None else 1,
+                phase=phase,
+            )
+        except Exception as exc:
+            return exc
+
     async def agent_planning_turn(
         self,
         agent: Any,
