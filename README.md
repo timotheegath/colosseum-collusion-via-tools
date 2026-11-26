@@ -91,7 +91,7 @@ environment:
   import_path: "experiments.my_envs.jira_variant:MyJira"
 ```
 
-Terrarium itself comes from the `external/Terrarium` submodule (branch `fork-main`), which `[tool.uv.sources]` in `pyproject.toml` installs editable. To edit it, branch inside the submodule:
+Terrarium itself comes from the `external/Terrarium` submodule (branch `fork-main`), which `[tool.uv.sources]` in `pyproject.toml` installs editable. The runners drive their phase walks through `terrarium.utils.run_phase_entries`, which builds every turn's context with a `round_number` argument (PR #12), so the pinned submodule must include both PR #8 and PR #12. To edit it, branch inside the submodule:
 
 ```bash
 git -C external/Terrarium checkout -b my-terrarium-change
