@@ -17,12 +17,12 @@ If you find the repo or paper useful or interesting please :star: it!
   </a>
 </p>
 
-This repo contains experiments for Colosseum under `experiments/` that utilizes the [Terrarium](https://github.com/umass-aisec/Terrarium) (`terrarium-agents==0.2.1`) framework.
+This repo contains experiments for Colosseum under `experiments/` that utilizes a fork of the [Terrarium](https://github.com/umass-aisec/Terrarium) framework (`terrarium-agents==0.2.1`), pinned as the `external/Terrarium` submodule on branch `fork-main` and installed editable via `[tool.uv.sources]` in `pyproject.toml`.
 
 
 ## Setup
 
-1) Clone with submodules (CoLLAB is used by the DCOP environments):
+1) Clone with submodules (CoLLAB is used by the DCOP environments; `external/Terrarium` is the Terrarium fork this repo runs on):
 - `git clone --recurse-submodules https://github.com/umass-ai-safety/colosseum.git && cd colosseum`
 - Already cloned without them? Run `git submodule update --init --recursive`.
 - Alternative: clone [CoLLAB](https://github.com/Saad-Mahmud/CoLLAB_SEA) anywhere and set `TERRARIUM_COLLAB_PATH=/path/to/CoLLAB` in `.env` (step 3) or your shell.
@@ -91,24 +91,20 @@ environment:
   import_path: "experiments.my_envs.jira_variant:MyJira"
 ```
 
-To edit Terrarium itself, install an editable checkout of the matching release:
+Terrarium itself comes from the `external/Terrarium` submodule (branch `fork-main`), which `[tool.uv.sources]` in `pyproject.toml` installs editable. To edit it, branch inside the submodule:
 
 ```bash
-git clone --recurse-submodules --branch v0.2.1 https://github.com/umass-aisec/Terrarium.git ../Terrarium
-```
-```toml
-# pyproject.toml
-[tool.uv.sources]
-terrarium-agents = { path = "../Terrarium", editable = true }
+git -C external/Terrarium checkout -b my-terrarium-change
+# edit external/Terrarium/terrarium/...
 ```
 
-Then recreate the venv so no files from the PyPI install shadow the checkout (Terrarium writes generated CoLLAB instances inside its installed package, and those survive an uninstall). Add `--extra vllm` to the sync if you use vLLM:
+Edits under `external/Terrarium/terrarium/` take effect without reinstalling. After committing them, bump the submodule pointer from this repo (`git add external/Terrarium`) and re-run `uv sync --no-install-project` so the venv and `uv.lock` follow the new commit. If you previously synced against the PyPI release, recreate the venv once so no files from the PyPI install shadow the editable checkout (Terrarium writes generated CoLLAB instances inside its installed package, and those survive an uninstall):
 
 ```bash
 rm -rf .venv && uv venv --python 3.11 .venv && uv sync --no-install-project
 ```
 
-Edits under `../Terrarium/terrarium/` then take effect without reinstalling. Keys still come from this repo's `.env`; a `.env` in `../Terrarium` is ignored. (A plain `uv pip install -e` is undone by the next `uv sync`.) This also rewrites `uv.lock` to point at your local checkout, so keep the `pyproject.toml` and `uv.lock` changes out of commits (`git restore pyproject.toml uv.lock` before committing).
+Keys still come from this repo's `.env`; a `.env` in `external/Terrarium` is ignored.
 
 ## Citation
 Please cite us using:
