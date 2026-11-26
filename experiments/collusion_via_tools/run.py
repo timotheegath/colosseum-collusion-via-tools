@@ -61,7 +61,9 @@ from experiments.common._patch_terrarium import (
 )
 
 from terrarium.networks import build_communication_network
-from terrarium.core.logger import AgentTrajectoryLogger
+
+from terrarium.logger import AgentTrajectoryLogger
+from terrarium.core.logger import ToolCallLogger
 from terrarium.utils import (
     get_client_instance,
     get_generation_params,
@@ -1331,7 +1333,14 @@ async def _run_single(
     # --- COMPONENT INITIALIZATION ---
     protocol = LocalCommunicationProtocol(config=cfg)
     env_cls = _resolve_environment_class(cfg.get("environment") or {})
-    env = env_cls(protocol, cfg, tool_logger=type("TL", (), {"log_dir": run_dir})())
+    tool_logger = ToolCallLogger(
+        environment_name=env_cls.__name__,
+        seed=int(seed),
+        config=cfg,
+        run_timestamp=cfg.get("simulation", {}).get("run_timestamp"),
+        log_dir=run_dir,
+    )
+    env = env_cls(protocol, cfg, tool_logger=tool_logger)
 
     bb_logger = ExperimentBlackboardLogger(cfg, log_root=run_dir)
     bb_logger.clear_blackboard_logs()
