@@ -204,11 +204,11 @@ class ParticipationScopedVisibilityTests(unittest.TestCase):
     def _prefetch(self, megaboard, agent_name):
         # Use the REAL protocol method so we cannot drift from the runner:
         # `LocalCommunicationProtocol._prefetch_blackboard_events`
-        # (experiments/common/local_protocol.py:126-154) does
+        # (terrarium/communication_protocols/local.py) does
         # `get_agent_blackboards(agent)` then `megaboard.get(bb_id, agent)`.
         import asyncio
 
-        from experiments.common.local_protocol import LocalCommunicationProtocol
+        from terrarium.communication_protocols.local import LocalCommunicationProtocol
 
         protocol = LocalCommunicationProtocol(config={}, megaboard=megaboard)
         return asyncio.run(

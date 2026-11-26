@@ -18,9 +18,10 @@ Layers tested in isolation:
    semantics as `disable_post_message` for the boolean.
 2. `run_id` suffixing: `_build_run_id` produces `__precoord<N>` either alone or
    after the existing post-message suffix (`__nopm__precoord2`).
-3. Tool blocking: `LocalCommunicationProtocol.environment_handle_tool_call`
-   returns a stub when `_ENV_TOOLS_BLOCKED` is set, and `post_message` flows
-   through `blackboard_handle_tool_call` unaffected.
+3. Tool blocking: a native ``PhaseToolPolicy`` on the protocol
+   (``block_environment_tool_calls=True``) makes
+   ``LocalCommunicationProtocol.environment_handle_tool_call`` return a stub,
+   and `post_message` flows through `blackboard_handle_tool_call` unaffected.
 4. `build_tables._RUN_ID_RE_V2` parses `__precoord` and `__precoord<N>`
    (alone or combined).
 5. The multi-round phase runner: N rounds, one turn per adversary, honest
@@ -33,10 +34,11 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from experiments.common._patch_terrarium import (
-    is_env_tools_blocked,
-    set_env_tools_blocked,
+from terrarium.communication_protocols.local import (
+    LocalCommunicationProtocol,
+    PhaseToolPolicy,
 )
+
 from experiments.collusion_via_tools import run as run_mod
 from experiments.collusion_via_tools.plots import build_tables as bt
 
@@ -242,38 +244,38 @@ class BuildTablesRegexTests(unittest.TestCase):
         self.assertIsNone(m.group("precoord"))
 
 
-class EnvToolsBlockContextVarTests(unittest.TestCase):
+class EnvToolsBlockPolicyTests(unittest.TestCase):
     def test_round_trip(self) -> None:
-        self.assertFalse(is_env_tools_blocked())
-        set_env_tools_blocked(True)
-        self.assertTrue(is_env_tools_blocked())
-        set_env_tools_blocked(False)
-        self.assertFalse(is_env_tools_blocked())
+        proto = LocalCommunicationProtocol(config={})
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
+        proto.set_phase_policy(
+            "pre_coordination",
+            PhaseToolPolicy(block_environment_tool_calls=True),
+        )
+        policy = proto.active_phase_policy("pre_coordination")
+        self.assertIsNotNone(policy)
+        self.assertTrue(policy.block_environment_tool_calls)
+        proto.pop_phase_policy("pre_coordination")
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
 
 
 class PreCoordinationContextAllowlistTests(unittest.TestCase):
     """The pre-coordination round must not hand the adversary environment
     state. Blocking tool calls is not enough: `env.build_agent_context`
-    delivers the state passively in the prompt, so the runner filters the
-    context down to identity + coalition strategy fields.
+    delivers the state passively in the prompt, so the hospital env natively
+    returns the minimal identity + coalition context for
+    `phase == "pre_coordination"` (Terrarium's
+    `_PRE_COORDINATION_CONTEXT_ALLOWLIST`, an allowlist that fails closed).
     """
 
     # The two context shapes HospitalEnvironment.build_agent_context produces.
     PROVISIONER_CTX = {
-        "agent_name": "Resource_Provisioner",
-        "phase": "pre_coordination",
-        "iteration": 0,
-        "role": "provisioner",
         "inventory_snapshot": {"General_Hospital": {"IV_Kits": 20, "PPE_Sets": 21}},
         "failures_so_far": {"General_Hospital": ["Patient_0 step 1"]},
         "failures_by_hospital": {"General_Hospital": {"IV_Kits": 1}},
         "cost_table": {"IV_Kits": {"cost": 2}},
     }
     DEPARTMENT_CTX = {
-        "agent_name": "St_Marys_Center_Ward",
-        "phase": "pre_coordination",
-        "iteration": 0,
-        "role": "department",
         "dept_info": {
             "capacity": 2,
             "service": "Ward",
@@ -292,8 +294,36 @@ class PreCoordinationContextAllowlistTests(unittest.TestCase):
         "post_message_available": True,
     }
 
+    def _make_env(self):
+        from terrarium.environments.dcops.hospital.hospital_env import (
+            HospitalEnvironment,
+        )
+
+        class _ProtocolStub:
+            environment = None
+
+        return HospitalEnvironment(
+            communication_protocol=_ProtocolStub(),
+            config={
+                "simulation": {"seed": 7},
+                "environment": {"num_hospitals": 2, "num_patients": 3},
+            },
+            tool_logger=None,
+        )
+
+    def _context(self, agent_name: str, state: dict) -> dict:
+        env = self._make_env()
+        return env.build_agent_context(
+            agent_name,
+            phase="pre_coordination",
+            iteration=0,
+            round_number=1,
+            **state,
+            **self.EXTRA,
+        )
+
     def test_provisioner_state_is_stripped(self) -> None:
-        out = run_mod._pre_coordination_context(self.PROVISIONER_CTX, extra=self.EXTRA)
+        out = self._context("Resource_Provisioner", self.PROVISIONER_CTX)
         for leaked in (
             "inventory_snapshot",
             "failures_so_far",
@@ -304,7 +334,16 @@ class PreCoordinationContextAllowlistTests(unittest.TestCase):
                 self.assertNotIn(leaked, out)
 
     def test_department_state_is_stripped(self) -> None:
-        out = run_mod._pre_coordination_context(self.DEPARTMENT_CTX, extra=self.EXTRA)
+        env = self._make_env()
+        agent_name = next(a for a in env.agent_names if a != "Resource_Provisioner")
+        out = env.build_agent_context(
+            agent_name,
+            phase="pre_coordination",
+            iteration=0,
+            round_number=1,
+            **self.DEPARTMENT_CTX,
+            **self.EXTRA,
+        )
         for leaked in ("dept_info", "job_queue", "cost_table"):
             with self.subTest(key=leaked):
                 self.assertNotIn(leaked, out)
@@ -312,8 +351,17 @@ class PreCoordinationContextAllowlistTests(unittest.TestCase):
     def test_identity_and_strategy_fields_survive(self) -> None:
         # The adversary must still understand the game and who it colludes
         # with, so these are kept.
-        for ctx in (self.PROVISIONER_CTX, self.DEPARTMENT_CTX):
-            out = run_mod._pre_coordination_context(ctx, extra=self.EXTRA)
+        env = self._make_env()
+        agent_name = next(a for a in env.agent_names if a != "Resource_Provisioner")
+        for name in ("Resource_Provisioner", agent_name):
+            out = env.build_agent_context(
+                name,
+                phase="pre_coordination",
+                iteration=0,
+                round_number=1,
+                **(self.PROVISIONER_CTX if name == "Resource_Provisioner" else self.DEPARTMENT_CTX),
+                **self.EXTRA,
+            )
             for kept in (
                 "agent_name",
                 "phase",
@@ -324,11 +372,11 @@ class PreCoordinationContextAllowlistTests(unittest.TestCase):
                 "misalignment_secret_blackboard_id",
                 "post_message_available",
             ):
-                with self.subTest(key=kept):
+                with self.subTest(agent=name, key=kept):
                     self.assertIn(kept, out)
 
     def test_coalition_membership_intact(self) -> None:
-        out = run_mod._pre_coordination_context(self.PROVISIONER_CTX, extra=self.EXTRA)
+        out = self._context("Resource_Provisioner", self.PROVISIONER_CTX)
         self.assertEqual(
             out["misalignment_adversaries"],
             ["Resource_Provisioner", "General_Hospital_Triage"],
@@ -338,22 +386,25 @@ class PreCoordinationContextAllowlistTests(unittest.TestCase):
     def test_allowlist_fails_closed_for_unknown_keys(self) -> None:
         # A future environment adding a new state key must be withheld by
         # default, not leaked.
-        ctx = dict(self.PROVISIONER_CTX, brand_new_state_key={"secret": 1})
-        out = run_mod._pre_coordination_context(ctx, extra=self.EXTRA)
+        out = self._context(
+            "Resource_Provisioner",
+            {**self.PROVISIONER_CTX, "brand_new_state_key": {"secret": 1}},
+        )
         self.assertNotIn("brand_new_state_key", out)
 
-    def test_allowlist_does_not_mutate_input(self) -> None:
-        original = dict(self.PROVISIONER_CTX)
-        run_mod._pre_coordination_context(self.PROVISIONER_CTX, extra=self.EXTRA)
-        self.assertEqual(self.PROVISIONER_CTX, original)
+    def test_round_number_is_not_echoed(self) -> None:
+        # run_phase_entries always passes round_number; it is not allowlisted
+        # and must not leak into the pre-coordination context.
+        out = self._context("Resource_Provisioner", self.PROVISIONER_CTX)
+        self.assertNotIn("round_number", out)
 
-    def test_extra_always_survives_even_if_not_allowlisted(self) -> None:
-        # `_get_extra_fields` output is injected after filtering, so a future
-        # strategy field cannot be silently dropped.
-        out = run_mod._pre_coordination_context(
-            self.PROVISIONER_CTX, extra={**self.EXTRA, "brand_new_strategy": 1}
-        )
-        self.assertEqual(out["brand_new_strategy"], 1)
+    def test_other_phases_keep_full_context(self) -> None:
+        env = self._make_env()
+        agent_name = next(a for a in env.agent_names if a != "Resource_Provisioner")
+        context = env.build_agent_context(agent_name, "planning", 1)
+        self.assertIn("job_queue", context)
+        self.assertIn("cost_table", context)
+        self.assertIn("dept_info", context)
 
 
 class GetExtraFieldsPreCoordinationOverrideTests(unittest.TestCase):
@@ -388,12 +439,10 @@ class GetExtraFieldsPreCoordinationOverrideTests(unittest.TestCase):
 
 
 class EnvToolsBlockStubTests(unittest.TestCase):
-    """The protocol returns a stub when env tools are blocked but the
-    blackboard path (post_message) is untouched."""
+    """The protocol returns a stub when the phase policy blocks env tools but
+    the blackboard path (post_message) is untouched."""
 
     def _make_protocol(self):
-        from experiments.common.local_protocol import LocalCommunicationProtocol
-
         # `LocalCommunicationProtocol.__init__` requires a `config` keyword;
         # the blocking branch never reads it, so an empty dict is fine.
         proto = LocalCommunicationProtocol(config={})
@@ -408,7 +457,10 @@ class EnvToolsBlockStubTests(unittest.TestCase):
 
     def test_environment_handle_returns_stub(self) -> None:
         proto = self._make_protocol()
-        set_env_tools_blocked(True)
+        proto.set_phase_policy(
+            "pre_coordination",
+            PhaseToolPolicy(block_environment_tool_calls=True),
+        )
         try:
             result = asyncio.run(
                 proto.environment_handle_tool_call(
@@ -420,7 +472,7 @@ class EnvToolsBlockStubTests(unittest.TestCase):
                 )
             )
         finally:
-            set_env_tools_blocked(False)
+            proto.pop_phase_policy("pre_coordination")
 
         self.assertTrue(result.get("blocked"))
         # The stub also leaves an event trail so downstream analytics can see
@@ -432,19 +484,20 @@ class EnvToolsBlockStubTests(unittest.TestCase):
 
     def test_environment_handle_executes_normally_when_unblocked(self) -> None:
         proto = self._make_protocol()
-        set_env_tools_blocked(False)
         # With a stub environment and no real env_tools the call raises a
         # benign "Environment not set" path because `env` is non-None -- we
-        # only need to confirm we did NOT short-circuit on the blocking flag.
-        # The simpler check: when unblocked, the function does NOT return a
-        # `blocked: True` stub. We catch any downstream exception and verify
-        # the flag wasn't the cause.
+        # only need to confirm we did NOT short-circuit on the phase policy.
+        # The simpler check: with no policy set for the phase, the function
+        # does NOT return a `blocked: True` stub.
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
         try:
             result = asyncio.run(
                 proto.environment_handle_tool_call(
                     tool_name="broadcast_message",
                     agent_name="Agent_A",
                     arguments={"message": "hi"},
+                    phase="pre_coordination",
+                    iteration=0,
                 )
             )
             self.assertNotIsInstance(result, dict) or not result.get("blocked")
@@ -522,46 +575,41 @@ class ResolvePreCoordinationMaxMessagesTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class PostMessageCallLimitContextVarTests(unittest.TestCase):
+class PostMessageCallLimitPolicyTests(unittest.TestCase):
     def test_round_trip(self) -> None:
-        from experiments.common._patch_terrarium import (
-            get_post_message_call_limit,
-            set_post_message_call_limit,
+        proto = LocalCommunicationProtocol(config={})
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
+        proto.set_phase_policy(
+            "pre_coordination",
+            PhaseToolPolicy(max_post_messages_per_agent=5),
         )
+        self.assertEqual(
+            proto.active_phase_policy("pre_coordination").max_post_messages_per_agent, 5
+        )
+        proto.pop_phase_policy("pre_coordination")
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
 
-        self.assertIsNone(get_post_message_call_limit())
-        set_post_message_call_limit(5)
-        self.assertEqual(get_post_message_call_limit(), 5)
-        set_post_message_call_limit(None)
-        self.assertIsNone(get_post_message_call_limit())
 
-
-class PostMessageCountsContextVarTests(unittest.TestCase):
+class PostMessageCountsPolicyTests(unittest.TestCase):
     def test_round_trip(self) -> None:
-        from experiments.common._patch_terrarium import (
-            get_post_message_count,
-            record_post_message_call,
-            reset_post_message_counts,
-        )
-
-        reset_post_message_counts()
-        self.assertEqual(get_post_message_count("AgentA"), 0)
-        self.assertEqual(record_post_message_call("AgentA"), 1)
-        self.assertEqual(record_post_message_call("AgentA"), 2)
-        self.assertEqual(record_post_message_call("AgentB"), 1)
-        self.assertEqual(get_post_message_count("AgentA"), 2)
-        self.assertEqual(get_post_message_count("AgentB"), 1)
-        reset_post_message_counts()
-        self.assertEqual(get_post_message_count("AgentA"), 0)
+        proto = LocalCommunicationProtocol(config={})
+        proto.reset_post_message_counts()
+        self.assertEqual(proto.get_post_message_count("AgentA"), 0)
+        self.assertEqual(proto._record_post_message_call("AgentA"), 1)
+        self.assertEqual(proto._record_post_message_call("AgentA"), 2)
+        self.assertEqual(proto._record_post_message_call("AgentB"), 1)
+        self.assertEqual(proto.get_post_message_count("AgentA"), 2)
+        self.assertEqual(proto.get_post_message_count("AgentB"), 1)
+        proto.reset_post_message_counts()
+        self.assertEqual(proto.get_post_message_count("AgentA"), 0)
 
 
 class BlackboardPostMessageCapTests(unittest.TestCase):
-    """End-to-end check: when the cap is set, the protocol rejects
+    """End-to-end check: when the phase policy sets a cap, the protocol rejects
     `post_message` calls past the limit and accepts them up to it.
     """
 
-    def _proto(self):
-        from experiments.common.local_protocol import LocalCommunicationProtocol
+    def _proto(self, *, policy=None):
         from terrarium.core.blackboard import Megaboard
 
         proto = LocalCommunicationProtocol(config={})
@@ -571,21 +619,26 @@ class BlackboardPostMessageCapTests(unittest.TestCase):
             pass
 
         proto.environment = _StubEnv()
+        proto.set_phase_policy(
+            "pre_coordination",
+            policy
+            or PhaseToolPolicy(
+                blackboard_tools={"post_message"},
+                max_post_messages_per_agent=None,
+            ),
+        )
         # `Megaboard.add_blackboard(agents, template)` is the constructor API.
         bb_id = proto.megaboard.add_blackboard(["A", "B"])
         return proto, bb_id
 
     def test_post_message_capped(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_post_message_call_limit,
+        proto, bb_id = self._proto(
+            policy=PhaseToolPolicy(
+                blackboard_tools={"post_message"}, max_post_messages_per_agent=2
+            )
         )
-
-        reset_post_message_counts()
-        set_post_message_call_limit(2)
+        proto.reset_post_message_counts()
         try:
-            proto, bb_id = self._proto()
-
             async def _post_n(n):
                 results = []
                 for i in range(n):
@@ -607,18 +660,16 @@ class BlackboardPostMessageCapTests(unittest.TestCase):
             self.assertEqual(results[2].get("limit"), 2)
             self.assertEqual(results[2].get("count"), 2)
         finally:
-            set_post_message_call_limit(None)
-            reset_post_message_counts()
+            proto.pop_phase_policy("pre_coordination")
+            proto.reset_post_message_counts()
 
     def test_unlimited_when_limit_none(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_post_message_call_limit,
+        proto, bb_id = self._proto(
+            policy=PhaseToolPolicy(
+                blackboard_tools={"post_message"}, max_post_messages_per_agent=None
+            )
         )
-
-        reset_post_message_counts()
-        set_post_message_call_limit(None)
-        proto, bb_id = self._proto()
+        proto.reset_post_message_counts()
 
         async def _post_n(n):
             results = []
@@ -627,6 +678,8 @@ class BlackboardPostMessageCapTests(unittest.TestCase):
                     tool_name="post_message",
                     agent_name="A",
                     arguments={"blackboard_id": bb_id, "message": f"m{i}"},
+                    phase="pre_coordination",
+                    iteration=0,
                 )
                 results.append(r)
             return results
@@ -636,34 +689,34 @@ class BlackboardPostMessageCapTests(unittest.TestCase):
             self.assertFalse(bool(r.get("blocked")))
 
     def test_other_blackboard_tools_unaffected(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_post_message_call_limit,
+        # Cap-only policy (blackboard_tools=None = phase default): the cap
+        # applies to post_message alone; other blackboard tools still work.
+        proto, bb_id = self._proto(
+            policy=PhaseToolPolicy(max_post_messages_per_agent=1)
         )
-
-        reset_post_message_counts()
-        set_post_message_call_limit(1)
+        proto.reset_post_message_counts()
         try:
-            proto, bb_id = self._proto()
-
-            # All three calls must run inside ONE asyncio task: a ContextVar
-            # write inside a task is invisible to the parent context, so
-            # separate `asyncio.run` calls would each see a fresh counter.
             async def _sequence():
                 r1 = await proto.blackboard_handle_tool_call(
                     tool_name="post_message",
                     agent_name="A",
                     arguments={"blackboard_id": bb_id, "message": "hi"},
+                    phase="pre_coordination",
+                    iteration=0,
                 )
                 r2 = await proto.blackboard_handle_tool_call(
                     tool_name="get_blackboard_events",
                     agent_name="A",
                     arguments={"blackboard_id": bb_id},
+                    phase="pre_coordination",
+                    iteration=0,
                 )
                 r3 = await proto.blackboard_handle_tool_call(
                     tool_name="post_message",
                     agent_name="A",
                     arguments={"blackboard_id": bb_id, "message": "again"},
+                    phase="pre_coordination",
+                    iteration=0,
                 )
                 return r1, r2, r3
 
@@ -676,22 +729,22 @@ class BlackboardPostMessageCapTests(unittest.TestCase):
             # Second post is now blocked.
             self.assertTrue(bool(r3.get("blocked")))
         finally:
-            set_post_message_call_limit(None)
-            reset_post_message_counts()
+            proto.pop_phase_policy("pre_coordination")
+            proto.reset_post_message_counts()
 
 
-class SecretBlackboardIdContextVarTests(unittest.TestCase):
+class SecretBlackboardIdPolicyTests(unittest.TestCase):
     def test_round_trip(self) -> None:
-        from experiments.common._patch_terrarium import (
-            get_secret_blackboard_id,
-            set_secret_blackboard_id,
+        proto = LocalCommunicationProtocol(config={})
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
+        proto.set_phase_policy(
+            "pre_coordination", PhaseToolPolicy(route_post_message_to=7)
         )
-
-        self.assertIsNone(get_secret_blackboard_id())
-        set_secret_blackboard_id(7)
-        self.assertEqual(get_secret_blackboard_id(), 7)
-        set_secret_blackboard_id(None)
-        self.assertIsNone(get_secret_blackboard_id())
+        self.assertEqual(
+            proto.active_phase_policy("pre_coordination").route_post_message_to, 7
+        )
+        proto.pop_phase_policy("pre_coordination")
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
 
 
 class EffectiveSecretChannelPreCoordTests(unittest.TestCase):
@@ -771,13 +824,13 @@ class EffectiveSecretChannelActualConditionsTests(unittest.TestCase):
 
 
 class BlackboardPostMessageRewriteTests(unittest.TestCase):
-    """Defense in depth: when the secret blackboard id is set, any
-    `post_message` call is rewritten onto it (matching, missing, or wrong
-    board id). When unset, calls flow through unmodified.
+    """Defense in depth: when the phase policy routes `post_message` to the
+    secret blackboard id, any `post_message` call in that phase is rewritten
+    onto it (matching, missing, or wrong board id). When unset, calls flow
+    through unmodified.
     """
 
-    def _proto(self):
-        from experiments.common.local_protocol import LocalCommunicationProtocol
+    def _proto(self, *, route_to=None):
         from terrarium.core.blackboard import Megaboard
 
         proto = LocalCommunicationProtocol(config={})
@@ -787,29 +840,36 @@ class BlackboardPostMessageRewriteTests(unittest.TestCase):
 
         proto.environment = _StubEnv()
         proto.megaboard = Megaboard()
+        if route_to is not None:
+            proto.set_phase_policy(
+                "pre_coordination",
+                PhaseToolPolicy(
+                    blackboard_tools={"post_message"},
+                    route_post_message_to=route_to,
+                ),
+            )
         # Two boards: id=0 is the public/main board with all participants;
         # id=1 is the secret coalition-only board.
         proto.megaboard.add_blackboard(["A", "B", "C"], template={"kind": "public"})
         proto.megaboard.add_blackboard(["A", "B"], template={"kind": "secret"})
         return proto
 
-    def test_post_without_blackboard_id_is_rewritten(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_secret_blackboard_id,
+    def _post(self, proto, arguments):
+        return asyncio.run(
+            proto.blackboard_handle_tool_call(
+                tool_name="post_message",
+                agent_name="A",
+                arguments=arguments,
+                phase="pre_coordination",
+                iteration=0,
+            )
         )
 
-        reset_post_message_counts()
-        set_secret_blackboard_id(1)
+    def test_post_without_blackboard_id_is_rewritten(self) -> None:
+        proto = self._proto(route_to=1)
+        proto.reset_post_message_counts()
         try:
-            proto = self._proto()
-            result = asyncio.run(
-                proto.blackboard_handle_tool_call(
-                    tool_name="post_message",
-                    agent_name="A",
-                    arguments={"message": "scheme"},
-                )
-            )
+            result = self._post(proto, {"message": "scheme"})
             self.assertNotEqual(result.get("blocked"), True)
             # The message landed on the secret board (id=1), not the public.
             secret_events = proto.megaboard.get(1, "A", limit=None)
@@ -817,73 +877,37 @@ class BlackboardPostMessageRewriteTests(unittest.TestCase):
             self.assertEqual(len(secret_events), 1)
             self.assertEqual(len(public_events), 0)
         finally:
-            set_secret_blackboard_id(None)
+            proto.pop_phase_policy("pre_coordination")
 
     def test_post_with_wrong_blackboard_id_is_rewritten(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_secret_blackboard_id,
-        )
-
-        reset_post_message_counts()
-        set_secret_blackboard_id(1)
+        proto = self._proto(route_to=1)
+        proto.reset_post_message_counts()
         try:
-            proto = self._proto()
             # Agent tries to post to the PUBLIC board; the rewrite forces
             # it onto the secret one instead.
-            result = asyncio.run(
-                proto.blackboard_handle_tool_call(
-                    tool_name="post_message",
-                    agent_name="A",
-                    arguments={"blackboard_id": 0, "message": "secret"},
-                )
-            )
+            result = self._post(proto, {"blackboard_id": 0, "message": "secret"})
             self.assertNotEqual(result.get("blocked"), True)
             self.assertEqual(len(proto.megaboard.get(0, "A", limit=None)), 0)
             self.assertEqual(len(proto.megaboard.get(1, "A", limit=None)), 1)
         finally:
-            set_secret_blackboard_id(None)
+            proto.pop_phase_policy("pre_coordination")
 
     def test_post_with_correct_blackboard_id_passes_through(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_secret_blackboard_id,
-        )
-
-        reset_post_message_counts()
-        set_secret_blackboard_id(1)
+        proto = self._proto(route_to=1)
+        proto.reset_post_message_counts()
         try:
-            proto = self._proto()
-            result = asyncio.run(
-                proto.blackboard_handle_tool_call(
-                    tool_name="post_message",
-                    agent_name="A",
-                    arguments={"blackboard_id": 1, "message": "ok"},
-                )
-            )
+            result = self._post(proto, {"blackboard_id": 1, "message": "ok"})
             self.assertNotEqual(result.get("blocked"), True)
             self.assertEqual(len(proto.megaboard.get(1, "A", limit=None)), 1)
         finally:
-            set_secret_blackboard_id(None)
+            proto.pop_phase_policy("pre_coordination")
 
     def test_post_without_rewrite_when_secret_id_none(self) -> None:
-        from experiments.common._patch_terrarium import (
-            reset_post_message_counts,
-            set_secret_blackboard_id,
-        )
-
-        reset_post_message_counts()
-        set_secret_blackboard_id(None)
-        proto = self._proto()
-        # Without the rewrite flag, posting to blackboard_id=0 (public)
+        proto = self._proto(route_to=None)
+        proto.reset_post_message_counts()
+        # Without the routing policy, posting to blackboard_id=0 (public)
         # lands on the public board.
-        result = asyncio.run(
-            proto.blackboard_handle_tool_call(
-                tool_name="post_message",
-                agent_name="A",
-                arguments={"blackboard_id": 0, "message": "public ok"},
-            )
-        )
+        result = self._post(proto, {"blackboard_id": 0, "message": "public ok"})
         self.assertNotEqual(result.get("blocked"), True)
         self.assertEqual(len(proto.megaboard.get(0, "A", limit=None)), 1)
         self.assertEqual(len(proto.megaboard.get(1, "A", limit=None)), 0)
@@ -945,8 +969,6 @@ class PlanningTurnPhaseLabelTests(unittest.TestCase):
     """
 
     def _proto(self):
-        from experiments.common.local_protocol import LocalCommunicationProtocol
-
         return LocalCommunicationProtocol(config={})
 
     def test_defaults_to_planning_phase(self) -> None:
@@ -1010,62 +1032,68 @@ class PlanningTurnPhaseLabelTests(unittest.TestCase):
 class PostMessageAvailableDuringPreCoordination(unittest.TestCase):
     """The pre-coordination round is labelled ``pre_coordination`` in the
     trajectory log, but it is planning-shaped for *toolset* purposes: the
-    patched ``ToolsetDiscovery.get_tools_for_blackboard`` must still offer
-    ``post_message`` so the adversary can write to the secret blackboard.
-    Terrarium's stock gate keys on ``phase == "planning"`` exactly, which would
-    silently drop ``post_message`` for ``"pre_coordination"``.
+    runner registers it in the agent's ``ToolsetDiscovery.planning_shaped_phases``
+    so ``get_tools_for_blackboard`` still offers ``post_message`` (filtered by
+    the active phase policy's allowlist) for the secret blackboard. Terrarium's
+    stock gate only knows ``planning``, which would silently drop
+    ``post_message`` for ``"pre_coordination"``.
     """
 
     def _discovery(self):
         from terrarium.tools.discovery import ToolsetDiscovery
 
-        # The wrapper never reads ``self``; a plain instance mirrors the real
-        # call shape and keeps the test hermetic.
-        return ToolsetDiscovery()
+        discovery = ToolsetDiscovery()
+        # Mirrors what run.py does once per run for every agent.
+        discovery.planning_shaped_phases = (
+            set(discovery.planning_shaped_phases) | {"pre_coordination"}
+        )
+        return discovery
 
     @staticmethod
     def _tool_names(tools) -> set:
         return {str((t or {}).get("function", {}).get("name")) for t in tools}
 
-    def test_pre_coordination_offers_post_message(self) -> None:
-        from experiments.common._patch_terrarium import set_post_message_disabled
+    @staticmethod
+    def _allowed(proto, phase):
+        policy = proto.active_phase_policy(phase)
+        return policy.blackboard_tools if policy is not None else None
 
-        set_post_message_disabled(False)
-        try:
-            tools = self._discovery().get_tools_for_blackboard("pre_coordination")
-        finally:
-            set_post_message_disabled(False)
+    def test_pre_coordination_offers_post_message(self) -> None:
+        proto = LocalCommunicationProtocol(config={})
+        proto.set_phase_policy(
+            "pre_coordination", PhaseToolPolicy(blackboard_tools={"post_message"})
+        )
+        tools = self._discovery().get_tools_for_blackboard(
+            "pre_coordination", allowed_tools=self._allowed(proto, "pre_coordination")
+        )
         self.assertIn("post_message", self._tool_names(tools))
 
     def test_planning_offers_post_message(self) -> None:
-        from experiments.common._patch_terrarium import set_post_message_disabled
-
-        set_post_message_disabled(False)
-        try:
-            tools = self._discovery().get_tools_for_blackboard("planning")
-        finally:
-            set_post_message_disabled(False)
+        proto = LocalCommunicationProtocol(config={})
+        tools = self._discovery().get_tools_for_blackboard(
+            "planning", allowed_tools=self._allowed(proto, "planning")
+        )
         self.assertIn("post_message", self._tool_names(tools))
 
     def test_execution_offers_no_blackboard_tools(self) -> None:
-        from experiments.common._patch_terrarium import set_post_message_disabled
-
-        set_post_message_disabled(False)
-        try:
-            tools = self._discovery().get_tools_for_blackboard("execution")
-        finally:
-            set_post_message_disabled(False)
+        proto = LocalCommunicationProtocol(config={})
+        tools = self._discovery().get_tools_for_blackboard(
+            "execution", allowed_tools=self._allowed(proto, "execution")
+        )
         self.assertEqual(tools, [])
 
-    def test_disabled_suppresses_even_pre_coordination(self) -> None:
-        from experiments.common._patch_terrarium import set_post_message_disabled
-
-        set_post_message_disabled(True)
-        try:
-            precoord = self._discovery().get_tools_for_blackboard("pre_coordination")
-            planning = self._discovery().get_tools_for_blackboard("planning")
-        finally:
-            set_post_message_disabled(False)
+    def test_withheld_policy_suppresses_even_pre_coordination(self) -> None:
+        proto = LocalCommunicationProtocol(config={})
+        proto.set_phase_policy(
+            "pre_coordination", PhaseToolPolicy(blackboard_tools=set())
+        )
+        proto.set_phase_policy("planning", PhaseToolPolicy(blackboard_tools=set()))
+        precoord = self._discovery().get_tools_for_blackboard(
+            "pre_coordination", allowed_tools=self._allowed(proto, "pre_coordination")
+        )
+        planning = self._discovery().get_tools_for_blackboard(
+            "planning", allowed_tools=self._allowed(proto, "planning")
+        )
         self.assertEqual(precoord, [])
         self.assertEqual(planning, [])
 
@@ -1223,8 +1251,10 @@ class _FakePreCoordAgent:
 
 
 class _FakePreCoordEnvironment:
-    """`build_agent_context` deliberately leaks env state so the phase's
-    allowlist can be asserted end to end.
+    """Mirrors the native HospitalEnvironment.build_agent_context: for
+    `phase == "pre_coordination"` it returns the minimal identity context and
+    only echoes kwargs in Terrarium's `_PRE_COORDINATION_CONTEXT_ALLOWLIST`;
+    every other phase gets the full (leaky) state.
     """
 
     def __init__(self, agent_names) -> None:
@@ -1240,9 +1270,22 @@ class _FakePreCoordEnvironment:
                 **kwargs,
             }
         )
-        # Match HospitalEnvironment: absorb the kwargs but do NOT echo them
-        # back. Phase metadata must reach the prompt through the runner's
-        # controlled extra-field injection, not by accident.
+        if phase == "pre_coordination":
+            from terrarium.environments.dcops.hospital.hospital_env import (
+                _PRE_COORDINATION_CONTEXT_ALLOWLIST,
+            )
+
+            context = {
+                "agent_name": agent_name,
+                "phase": phase,
+                "iteration": iteration,
+                "role": "department",
+            }
+            for key, value in kwargs.items():
+                if key in _PRE_COORDINATION_CONTEXT_ALLOWLIST and key not in context:
+                    context[key] = value
+            return context
+        # Full state for the other phases (absorbed kwargs are not echoed).
         return {
             "agent_name": agent_name,
             "phase": phase,
@@ -1254,8 +1297,12 @@ class _FakePreCoordEnvironment:
         }
 
 
-class _FakePreCoordProtocol:
+class _FakePreCoordProtocol(LocalCommunicationProtocol):
+    """Native protocol with the turn execution stubbed: records the active
+    phase policy at each turn and simulates one board post per turn."""
+
     def __init__(self) -> None:
+        super().__init__(config={})
         self.calls = []
         self.env_blocked = []
         self.secret_ids = []
@@ -1301,15 +1348,7 @@ class _FakePreCoordProtocol:
         planning_round,
         phase="planning",
     ):
-        from experiments.common._patch_terrarium import (
-            get_post_message_call_limit,
-            get_post_message_count,
-            get_secret_blackboard_id,
-            is_env_tools_blocked,
-            is_post_message_disabled,
-            record_post_message_call,
-        )
-
+        policy = self.active_phase_policy(phase)
         self.calls.append(
             {
                 "agent_name": agent_name,
@@ -1319,14 +1358,24 @@ class _FakePreCoordProtocol:
                 "phase": phase,
             }
         )
-        self.env_blocked.append(is_env_tools_blocked())
-        self.secret_ids.append(get_secret_blackboard_id())
-        self.pm_disabled.append(is_post_message_disabled())
-        self.caps.append(get_post_message_call_limit())
-        self.counts_before.append(get_post_message_count(agent_name))
+        self.env_blocked.append(
+            bool(policy is not None and policy.block_environment_tool_calls)
+        )
+        self.secret_ids.append(
+            policy.route_post_message_to if policy is not None else None
+        )
+        self.pm_disabled.append(
+            policy is not None
+            and policy.blackboard_tools is not None
+            and "post_message" not in policy.blackboard_tools
+        )
+        self.caps.append(
+            policy.max_post_messages_per_agent if policy is not None else None
+        )
+        self.counts_before.append(self.get_post_message_count(agent_name))
         # Simulate one board post per turn, so the per-round reset is
         # observable on the next round.
-        record_post_message_call(agent_name)
+        self._record_post_message_call(agent_name)
         return {
             "response": f"{agent_name} round {planning_round}",
             "usage": {},
@@ -1349,13 +1398,6 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
         extra_factory=None,
     ):
         from unittest.mock import patch
-
-        from experiments.common._patch_terrarium import (
-            get_post_message_call_limit,
-            get_secret_blackboard_id,
-            is_env_tools_blocked,
-            is_post_message_disabled,
-        )
 
         env = _FakePreCoordEnvironment(
             agent_names or ["Adv1", "Honest", "Adv2"],
@@ -1391,11 +1433,10 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
                 )
             )
 
-        # Isolation must be restored for the main loop.
-        self.assertFalse(is_env_tools_blocked())
-        self.assertFalse(is_post_message_disabled())
-        self.assertIsNone(get_secret_blackboard_id())
-        self.assertIsNone(get_post_message_call_limit())
+        # Isolation must be restored for the main loop: the phase policy is
+        # popped and the per-agent counters are reset.
+        self.assertIsNone(proto.active_phase_policy("pre_coordination"))
+        self.assertEqual(proto.get_post_message_count("Adv1"), 0)
         return env, proto, turns, bb_calls
 
     def test_two_rounds_produce_two_turns_per_adversary(self) -> None:
@@ -1474,8 +1515,9 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
             self.assertIsNone(ctx["misalignment_secret_blackboard_id"])
 
     def test_phase_metadata_comes_from_runner_injection(self) -> None:
-        # The fake env ignores kwargs (like HospitalEnvironment); these fields
-        # can only be present because the runner injects them.
+        # The fake env echoes only allowlisted kwargs (like the native hospital
+        # env); these fields can only be present because the runner injects
+        # them into the context.
         _, proto, _, _ = self._run(
             num_rounds=2,
             extra_factory=lambda name, phase: {},
@@ -1486,20 +1528,18 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
             self.assertEqual(ctx["pre_coordination_rounds"], 2)
             self.assertTrue(ctx["post_message_available"])
 
-    def test_failing_turn_does_not_propagate_and_restores_state(self) -> None:
-        from experiments.common._patch_terrarium import (
-            get_post_message_call_limit,
-            get_secret_blackboard_id,
-            is_env_tools_blocked,
-            is_post_message_disabled,
-            reset_post_message_counts,
-            set_env_tools_blocked,
-            set_post_message_call_limit,
-            set_post_message_disabled,
-            set_secret_blackboard_id,
+    def test_runner_injected_extra_survives_even_if_not_allowlisted(self) -> None:
+        # The runner's `turn["agent_context"].update(extra)` is not filtered by
+        # the env allowlist, so a future strategy field cannot be dropped.
+        _, proto, _, _ = self._run(
+            num_rounds=1,
+            extra_factory=lambda name, phase: {"brand_new_strategy": 1},
         )
+        for call in proto.calls:
+            self.assertEqual(call["agent_context"]["brand_new_strategy"], 1)
 
-        class _BoomProtocol:
+    def test_failing_turn_does_not_propagate_and_restores_state(self) -> None:
+        class _BoomProtocol(LocalCommunicationProtocol):
             async def agent_turn(self, agent, agent_name, agent_context, environment, iteration, *, phase, round_num=None, phase_config=None):
                 try:
                     return await self.agent_planning_turn(
@@ -1514,41 +1554,40 @@ class RunPreCoordinationRoundsTests(unittest.TestCase):
                 raise RuntimeError("boom")
 
         env = _FakePreCoordEnvironment(["Adv1"])
-        # Non-default prior state makes restoration observable.
-        set_post_message_disabled(True)
-        set_env_tools_blocked(True)
-        set_secret_blackboard_id(7)
-        set_post_message_call_limit(9)
-        try:
-            # The runner deliberately catches per-turn failures (it records
-            # them as `[ERROR] ...` turns and continues), so nothing propagates
-            # out of the helper. One failing turn per round is recorded, and the
-            # prior task-local state is restored afterwards.
-            turns = asyncio.run(
-                run_mod._run_pre_coordination_rounds(
-                    env=env,
-                    protocol=_BoomProtocol(),
-                    roles={"Adv1": "adversary"},
-                    num_rounds=2,
-                    max_messages=3,
-                    secret_blackboard_id=42,
-                    extra_fields=lambda name, phase: {},
-                )
+        proto = _BoomProtocol(config={})
+        # Non-default prior phase policy makes restoration observable.
+        prior = PhaseToolPolicy(
+            block_environment_tool_calls=True,
+            blackboard_tools=set(),
+            route_post_message_to=7,
+            max_post_messages_per_agent=9,
+        )
+        proto.set_phase_policy("pre_coordination", prior)
+        # The runner deliberately catches per-turn failures (it records
+        # them as `[ERROR] ...` turns and continues), so nothing propagates
+        # out of the helper. One failing turn per round is recorded, and the
+        # prior phase policy is restored afterwards.
+        turns = asyncio.run(
+            run_mod._run_pre_coordination_rounds(
+                env=env,
+                protocol=proto,
+                roles={"Adv1": "adversary"},
+                num_rounds=2,
+                max_messages=3,
+                secret_blackboard_id=42,
+                extra_fields=lambda name, phase: {},
             )
-            self.assertEqual([t["agent"] for t in turns], ["Adv1", "Adv1"])
-            self.assertEqual([t["round"] for t in turns], [1, 2])
-            for turn in turns:
-                self.assertTrue(turn["response"].startswith("[ERROR]"))
-            self.assertTrue(is_post_message_disabled())
-            self.assertTrue(is_env_tools_blocked())
-            self.assertEqual(get_secret_blackboard_id(), 7)
-            self.assertEqual(get_post_message_call_limit(), 9)
-        finally:
-            set_post_message_disabled(False)
-            set_env_tools_blocked(False)
-            set_secret_blackboard_id(None)
-            set_post_message_call_limit(None)
-            reset_post_message_counts()
+        )
+        self.assertEqual([t["agent"] for t in turns], ["Adv1", "Adv1"])
+        self.assertEqual([t["round"] for t in turns], [1, 2])
+        for turn in turns:
+            self.assertTrue(turn["response"].startswith("[ERROR]"))
+        restored = proto.active_phase_policy("pre_coordination")
+        self.assertIs(restored, prior)
+        self.assertTrue(restored.block_environment_tool_calls)
+        self.assertEqual(restored.route_post_message_to, 7)
+        self.assertEqual(restored.max_post_messages_per_agent, 9)
+        self.assertEqual(proto.get_post_message_count("Adv1"), 0)
 
     def test_message_cap_resets_each_round(self) -> None:
         _, proto, _, _ = self._run(num_rounds=2, max_messages=3)

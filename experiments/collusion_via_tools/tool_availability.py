@@ -2,13 +2,16 @@
 
 Terrarium decides which tools an agent can call *per turn* by asking its
 ``ToolsetDiscovery`` for two lists and concatenating them
-(``terrarium/agents/base.py:324-333``)::
+(``terrarium/agents/base.py``)::
 
     env_tools = self.toolset_discovery.get_tools_for_environment(
         self.environment_name, self.current_phase
     )
     blackboard_tools = self.toolset_discovery.get_tools_for_blackboard(
-        self.current_phase
+        self.current_phase,
+        self.environment_name,
+        retrieval_enabled=self.retrieval_enabled,
+        allowed_tools=self._allowed_blackboard_tools(),
     )
     tool_set = env_tools + blackboard_tools
 
@@ -23,26 +26,20 @@ Two phase gates exist:
 * ``schedule_patient`` is offered by ``HospitalTools.get_tools`` only when
   ``phase == "execution"`` (``terrarium/environments/dcops/hospital/hospital_tools.py``).
 * ``post_message`` is offered by ``ToolsetDiscovery.get_tools_for_blackboard``
-  only for the planning phase; the repo patch in
-  ``experiments/common/_patch_terrarium.py`` returns ``[]`` when
-  ``is_post_message_disabled()`` is true and remaps ``pre_coordination`` ->
-  ``planning`` so the secret window keeps the tool.
+  only for planning-shaped phases (``planning`` plus any phase the runner
+  registers, e.g. ``pre_coordination``), filtered by the active phase policy's
+  ``blackboard_tools`` allowlist (``set()`` withholds every blackboard tool).
 
-``PHASE_ENV_TOOLS_BLOCKED`` records the one phase where the *schemas* are still
-offered but every environment tool *call* is rejected at runtime: the
-pre-coordination round (``set_env_tools_blocked(True)`` at ``run.py:900``;
-``LocalCommunicationProtocol.environment_handle_tool_call`` returns
-``{"blocked": True, ...}`` for each env-tool invocation during that phase).
-``post_message`` is not blocked by that gate -- only environment tools are.
+``phase_env_tools_blocked`` reports the phases where the *schemas* are still
+offered but every environment tool *call* is rejected at runtime: a phase whose
+active ``PhaseToolPolicy`` sets ``block_environment_tool_calls`` (the
+pre-coordination round). ``post_message`` is not blocked by that gate -- only
+environment tools are.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
-
-# Phases in which environment tool CALLS are rejected at runtime even though
-# their schemas are offered to the model. See the module docstring.
-PHASE_ENV_TOOLS_BLOCKED: Tuple[str, ...] = ("pre_coordination",)
+from typing import Any, Dict, List, Optional, Tuple
 
 # The phases the runner walks the agents through, in prompt-relevant order.
 # ``phase_tool_map`` preserves this order so the rendered "it is available in:
@@ -60,6 +57,33 @@ _FALLBACK_ENV_TOOLS_ALWAYS: Tuple[str, ...] = (
     "broadcast_message",
 )
 _FALLBACK_ENV_TOOLS_EXECUTION_ONLY: Tuple[str, ...] = ("schedule_patient",)
+
+
+def _active_policy(protocol: Any, phase: str) -> Optional[Any]:
+    """Return the protocol's active ``PhaseToolPolicy`` for ``phase`` (or None)."""
+    active = getattr(protocol, "active_phase_policy", None)
+    if not callable(active):
+        return None
+    return active(phase)
+
+
+def _allowed_blackboard_tools(protocol: Any, phase: str) -> Optional[set]:
+    """Blackboard tool allowlist from the active phase policy (None = phase default)."""
+    policy = _active_policy(protocol, phase)
+    if policy is None:
+        return None
+    return policy.blackboard_tools
+
+
+def phase_env_tools_blocked(protocol: Any, phase: str) -> bool:
+    """Whether environment tool CALLS are rejected at runtime in ``phase``.
+
+    Derived from the active phase policy's ``block_environment_tool_calls``:
+    the schemas may still be offered to the model, but the protocol drops the
+    calls (``pre_coordination`` is the one such phase).
+    """
+    policy = _active_policy(protocol, phase)
+    return bool(policy is not None and policy.block_environment_tool_calls)
 
 
 def _extract_names(tools: Any) -> List[str]:
@@ -82,32 +106,41 @@ def _fallback_env_tool_names(phase: str) -> List[str]:
     return names
 
 
-def _fallback_blackboard_tool_names(phase: str) -> List[str]:
+def _fallback_blackboard_tool_names(phase: str, protocol: Any = None) -> List[str]:
     """Fallback blackboard toolset.
 
-    Upstream offers ``post_message`` only for the planning phase and the repo
-    patch remaps ``pre_coordination`` -> ``planning``. This fallback cannot see
-    the ``is_post_message_disabled()`` flag, so it assumes the tool is enabled;
-    it is only reached when the real discovery object is unavailable.
+    Upstream offers ``post_message`` only for planning-shaped phases
+    (``planning`` plus the runner-registered ``pre_coordination``). The
+    active phase policy's allowlist is honoured when a protocol is given
+    (``set()`` withholds the tool); this fallback is only reached when the
+    real discovery object is unavailable.
     """
-    if phase in ("planning", "pre_coordination"):
+    if phase not in ("planning", "pre_coordination"):
+        return []
+    allowed = _allowed_blackboard_tools(protocol, phase)
+    if allowed is None:
         return ["post_message"]
-    return []
+    return [name for name in ("post_message",) if name in allowed]
 
 
-def _fallback_tool_names(phase: str) -> List[str]:
-    return _fallback_env_tool_names(phase) + _fallback_blackboard_tool_names(phase)
+def _fallback_tool_names(phase: str, protocol: Any = None) -> List[str]:
+    return _fallback_env_tool_names(phase) + _fallback_blackboard_tool_names(phase, protocol)
 
 
-def tool_names_for_phase(agent: Any, env: Any, phase: str) -> List[str]:
+def tool_names_for_phase(
+    agent: Any,
+    env: Any,
+    phase: str,
+    protocol: Any = None,
+) -> List[str]:
     """Return the exact tool names ``agent`` can call in ``phase``.
 
     Computed the same way ``terrarium/agents/base.py`` does it: the environment
     toolset (for ``env``) followed by the blackboard toolset, both for ``phase``.
-    The blackboard lookup goes through the patched
-    ``ToolsetDiscovery.get_tools_for_blackboard``, so it honours the *current*
-    ``is_post_message_disabled()`` state -- callers must therefore compute this
-    **after** setting that flag for the agent/phase.
+    The blackboard lookup is filtered by the active phase policy's
+    ``blackboard_tools`` allowlist (via ``protocol.active_phase_policy(phase)``),
+    so callers must pass the run's protocol after setting the policy for the
+    agent/phase.
 
     Order is preserved (environment tools first, then blackboard tools). If the
     agent has no ``toolset_discovery`` -- or the discovery object yields no
@@ -130,7 +163,12 @@ def tool_names_for_phase(agent: Any, env: Any, phase: str) -> List[str]:
         except Exception:
             env_tools = []
         try:
-            blackboard_tools = discovery.get_tools_for_blackboard(phase)
+            blackboard_tools = discovery.get_tools_for_blackboard(
+                phase,
+                env_name,
+                retrieval_enabled=bool(getattr(agent, "retrieval_enabled", False)),
+                allowed_tools=_allowed_blackboard_tools(protocol, phase),
+            )
         except Exception:
             blackboard_tools = []
 
@@ -139,14 +177,16 @@ def tool_names_for_phase(agent: Any, env: Any, phase: str) -> List[str]:
             return names
         # Discovery produced nothing usable; fall through to the known toolset.
 
-    return _fallback_tool_names(phase)
+    return _fallback_tool_names(phase, protocol)
 
 
-def phase_tool_map(agent: Any, env: Any) -> Dict[str, List[str]]:
+def phase_tool_map(agent: Any, env: Any, protocol: Any = None) -> Dict[str, List[str]]:
     """Map every phase to the tool names offered in it.
 
-    Uses the *current* ``is_post_message_disabled()`` state for ``post_message``
-    (the flag is process/task-local, not per-phase), so the same map is valid
-    for the phase the caller is about to render. Keys follow ``_PHASES`` order.
+    Each phase is filtered by its own active phase policy (via
+    ``protocol.active_phase_policy(phase)``), so the map reflects the policy
+    currently set for each phase. Keys follow ``_PHASES`` order.
     """
-    return {phase: tool_names_for_phase(agent, env, phase) for phase in _PHASES}
+    return {
+        phase: tool_names_for_phase(agent, env, phase, protocol) for phase in _PHASES
+    }

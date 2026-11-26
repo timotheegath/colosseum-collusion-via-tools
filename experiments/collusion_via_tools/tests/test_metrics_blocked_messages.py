@@ -14,7 +14,7 @@ import networkx as nx
 import unittest
 
 from experiments.collusion_via_tools.metrics import compute_misalignment_metrics
-from experiments.common.local_protocol import ToolEvent
+from terrarium.communication_protocols.local import ToolEvent
 
 
 AGENTS = ("A", "B", "C")

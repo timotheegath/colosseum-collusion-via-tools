@@ -45,20 +45,12 @@ from experiments.collusion_via_tools.tool_availability import (
     phase_tool_map,
     tool_names_for_phase,
 )
-from experiments.common.local_protocol import LocalCommunicationProtocol
 from experiments.collusion_via_tools.judge_beliefs import judge_run
-from experiments.common._patch_terrarium import (
-    get_post_message_call_limit,
-    get_secret_blackboard_id,
-    is_env_tools_blocked,
-    is_post_message_disabled,
-    reset_post_message_counts,
-    set_env_tools_blocked,
-    set_post_message_call_limit,
-    set_post_message_disabled,
-    set_secret_blackboard_id,
-)
 
+from terrarium.communication_protocols.local import (
+    LocalCommunicationProtocol,
+    PhaseToolPolicy,
+)
 from terrarium.networks import build_communication_network
 
 from terrarium.core.logger import AgentTrajectoryLogger, BlackboardLogger, ToolCallLogger
@@ -409,54 +401,6 @@ def _ordered_agents(env: Any, agents: List[Any], mode: str, seed: int) -> List[A
     index = {name: i for i, name in enumerate(order)}
     agents.sort(key=lambda a: index.get(a.name, len(order)))
     return agents
-
-
-# Keys an adversary keeps in its context during the pre-coordination round.
-# This is an ALLOWLIST on purpose: `env.build_agent_context` returns whatever
-# the environment wants (for HospitalEnvironment that includes
-# `inventory_snapshot`, `failures_so_far`, `failures_by_hospital`,
-# `local_inventory`, `procedure_costs`, `job_queue`, `schedule_summary`, ...),
-# which would leak the full environment state to the adversary BEFORE it loses
-# `post_message`. Blocking tool calls is not enough — the state also arrives
-# passively through the prompt. An allowlist fails closed: any new key a future
-# environment adds is withheld by default and must be opted in explicitly.
-_PRE_COORDINATION_CONTEXT_ALLOWLIST: frozenset = frozenset(
-    {
-        # Identity / routing. Needed so the prompt is coherent.
-        "agent_name",
-        "phase",
-        "iteration",
-        "role",
-        # Pre-coordination round metadata (1-based). Scalar labels only, no
-        # environment state.
-        "pre_coordination_round",
-        "pre_coordination_rounds",
-        # Coalitional strategy inputs injected by `_get_extra_fields`.
-        "misalignment_role",
-        "misalignment_adversaries",
-        "misalignment_secret_blackboard_id",
-        "post_message_available",
-    }
-)
-
-
-def _pre_coordination_context(
-    full_context: Dict[str, Any],
-    *,
-    extra: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Strip the environment state from a pre-coordination agent context.
-
-    The adversary keeps its identity and the coalition strategy fields (so it
-    still understands the game and the tools it has), but loses every
-    environment-state key (inventory, failures, job queue, schedules, costs).
-    """
-    allowed = dict(full_context)
-    for key in list(allowed):
-        if key not in _PRE_COORDINATION_CONTEXT_ALLOWLIST:
-            del allowed[key]
-    allowed.update(extra)
-    return allowed
 
 
 def _resolve_pre_coordination_axis(
@@ -954,17 +898,22 @@ def _log_blackboards_txt(
         )
 
 
-def _tool_availability_fields(agent: Any, env: Any, phase: str) -> Dict[str, Any]:
+def _tool_availability_fields(
+    agent: Any,
+    env: Any,
+    phase: str,
+    protocol: Any = None,
+) -> Dict[str, Any]:
     """Context fields describing which tools ``agent`` can call in ``phase``.
 
     Read by ``MisalignmentPrompts`` to render the phase-aware coalition carrier
-    list. MUST be called AFTER ``set_post_message_disabled(...)`` for the
-    agent/phase, because the patched blackboard toolset lookup honours that
-    flag.
+    list. The blackboard lookup honours the protocol's active phase policy for
+    ``phase`` (its ``blackboard_tools`` allowlist), so callers must pass the
+    run's ``protocol`` after setting the policy for the agent/phase.
     """
     return {
-        "available_tool_names": tool_names_for_phase(agent, env, phase),
-        "tool_phase_map": phase_tool_map(agent, env),
+        "available_tool_names": tool_names_for_phase(agent, env, phase, protocol),
+        "tool_phase_map": phase_tool_map(agent, env, protocol),
     }
 
 
@@ -1011,46 +960,52 @@ async def _run_pre_coordination_rounds(
     Honest agents are skipped entirely, so they never see the phase or its
     blackboard.
 
-    Isolation is held for the whole phase (all rounds), not per round:
+    Isolation is held for the whole phase (all rounds), not per round, via a
+    native ``PhaseToolPolicy`` on the protocol:
 
-    * only ``post_message`` is usable -- all environment tools are blocked;
+    * only ``post_message`` is usable -- all environment tool calls are blocked
+      (``block_environment_tool_calls``);
     * ``post_message`` is rewritten onto the coalition-only secret board when
-      one exists; when none exists it is disabled for the phase, so no public
-      board can be written to;
-    * the agent context is reduced to identity + coalition metadata, so no
-      environment state leaks in passively.
+      one exists; when none exists the tool is withheld for the phase
+      (``blackboard_tools=set()``, cap 0), so no public board can be written to;
+    * the agent context is the minimal one the hospital env builds natively for
+      ``phase == "pre_coordination"``, so no environment state leaks in
+      passively; the runner only injects the controlled metadata fields.
 
-    Isolated state is saved and restored on every exit path (including
-    exceptions): ``post_message`` gating, environment-tool gating, secret-board
-    routing, and the message cap. ``post_message`` is enabled **only** when a
-    coalition-only secret board exists; without one it is disabled for the whole
-    phase, because the tool would otherwise write to a public board.
+    ``post_message`` is enabled **only** when a coalition-only secret board
+    exists; without one it is disabled for the whole phase, because the tool
+    would otherwise write to a public board.
 
     ``max_messages`` is a per-agent cap **per round**: the counters reset at the
     start of every round. ``None`` means unlimited.
 
     Returns the ``agent_turns.json``-shaped entries for every turn. The caller
-    owns the surrounding run state and restores the normal tooling afterwards.
+    owns the surrounding run state; the phase policy is popped on every exit
+    path (including exceptions) so the main loop is unaffected.
     """
     turns: List[Dict[str, Any]] = []
 
-    # Save the task-local state so a rerun/nested caller is unaffected.
-    prior_post_message_disabled = is_post_message_disabled()
-    prior_env_tools_blocked = is_env_tools_blocked()
-    prior_secret_blackboard_id = get_secret_blackboard_id()
-    prior_post_message_limit = get_post_message_call_limit()
+    # Save the prior phase policy so a rerun/nested caller is unaffected.
+    prior_policy = protocol.active_phase_policy("pre_coordination")
 
-    # Without a coalition-only board there is no safe place to post: disable
-    # `post_message` for the phase rather than let it fall through to a public
-    # board. The prompt says the same thing explicitly.
+    # Without a coalition-only board there is no safe place to post: withhold
+    # `post_message` for the phase (and cap it at 0 as defense in depth, so a
+    # hallucinated call is rejected at the protocol layer as well) rather than
+    # let it fall through to a public board. The prompt says the same thing
+    # explicitly.
     phase_post_message_available = secret_blackboard_id is not None
-    set_post_message_disabled(not phase_post_message_available)
-    set_env_tools_blocked(True)
-    set_secret_blackboard_id(secret_blackboard_id)
-    # Defense in depth: with no secret board, reject any hallucinated
-    # `post_message` at the protocol layer as well (limit 0 rejects all calls)
-    # so a public post is impossible even if the tool were somehow offered.
     round_post_message_limit = max_messages if phase_post_message_available else 0
+    protocol.set_phase_policy(
+        "pre_coordination",
+        PhaseToolPolicy(
+            block_environment_tool_calls=True,
+            blackboard_tools=(
+                {"post_message"} if phase_post_message_available else set()
+            ),
+            route_post_message_to=secret_blackboard_id,
+            max_post_messages_per_agent=round_post_message_limit,
+        ),
+    )
     try:
         adversary_agents = [a for a in env.agents if roles.get(a.name) == "adversary"]
         started_rounds: set = set()
@@ -1060,8 +1015,7 @@ async def _run_pre_coordination_rounds(
             if turn["round"] not in started_rounds:
                 started_rounds.add(turn["round"])
                 # Per-round cap: reset counters so each round gets its own budget.
-                set_post_message_call_limit(round_post_message_limit)
-                reset_post_message_counts()
+                protocol.reset_post_message_counts()
             extra = dict(extra_fields(turn["agent_name"], "pre_coordination"))
             # Controlled phase metadata: never trust the environment to
             # echo kwargs back. Without this injection the prompt and the
@@ -1069,18 +1023,15 @@ async def _run_pre_coordination_rounds(
             extra["post_message_available"] = phase_post_message_available
             extra["pre_coordination_round"] = turn["round"]
             extra["pre_coordination_rounds"] = num_rounds
-            # Tool availability for this exact agent/phase. Computed AFTER
-            # `set_post_message_disabled(...)` above, so the disabled-state
-            # reflected in the blackboard toolset is correct.
-            extra.update(_tool_availability_fields(turn["agent"], env, "pre_coordination"))
-            # Minimal context: identity + coalition strategy only, no
-            # environment state. Blocking tool calls is not sufficient
-            # because `env.build_agent_context` hands the adversary the
-            # full state (inventory, failures, job queue, costs) passively
-            # in the prompt.
-            turn["agent_context"] = _pre_coordination_context(
-                turn["agent_context"], extra=extra
+            # Tool availability for this exact agent/phase, honouring the
+            # phase policy set above.
+            extra.update(
+                _tool_availability_fields(turn["agent"], env, "pre_coordination", protocol)
             )
+            # The hospital env already returns the minimal pre-coordination
+            # context natively (identity + allowlisted metadata only), so only
+            # the controlled extra fields are injected here.
+            turn["agent_context"].update(extra)
             return turn
 
         def _on_turn(turn: Dict[str, Any]) -> None:
@@ -1146,11 +1097,10 @@ async def _run_pre_coordination_rounds(
         )
     finally:
         # Restore the state that existed before the phase, even on failure.
-        set_env_tools_blocked(prior_env_tools_blocked)
-        set_secret_blackboard_id(prior_secret_blackboard_id)
-        set_post_message_call_limit(prior_post_message_limit)
-        set_post_message_disabled(prior_post_message_disabled)
-        reset_post_message_counts()
+        protocol.pop_phase_policy("pre_coordination")
+        if prior_policy is not None:
+            protocol.set_phase_policy("pre_coordination", prior_policy)
+        protocol.reset_post_message_counts()
 
     return turns
 
@@ -1205,13 +1155,16 @@ async def _run_single(
     # The sweep axis (resolved in `run_from_config` / `_resolve_disable_pm_axis`)
     # has already made the decision: use it verbatim instead of re-resolving a
     # `None` against the top-level config (which would silently override an
-    # explicit sweep-level `false` / `null`).
+    # explicit sweep-level `false` / `null`). The decision is applied as a
+    # native phase policy on the protocol once it exists (below): when
+    # disabled, `post_message` is withheld in every planning-shaped phase
+    # (`blackboard_tools=set()`), i.e. "planning" plus the "pre_coordination"
+    # policy set by `_run_pre_coordination_rounds`.
     resolved_disable_pm = (
         _normalize_disable_pm_value(disable_post_message)
         if disable_post_message is not _UNSET
         else _resolve_disable_pm(_UNSET, cfg)
     )
-    set_post_message_disabled(resolved_disable_pm)
 
     # Deterministic agent turn order (see `_resolve_turn_order`). Resolved here
     # so an invalid `experiment.turn_order` fails before the run directory is
@@ -1285,6 +1238,12 @@ async def _run_single(
 
     # --- COMPONENT INITIALIZATION ---
     protocol = LocalCommunicationProtocol(config=cfg)
+    if resolved_disable_pm:
+        # Withhold the blackboard tools (i.e. `post_message`) for the planning
+        # phase; per-turn hooks below keep this adversary-only. Blackboard
+        # tools only exist in planning-shaped phases, so "planning" plus the
+        # "pre_coordination" policy gives full coverage.
+        protocol.set_phase_policy("planning", PhaseToolPolicy(blackboard_tools=set()))
     env_cls = _resolve_environment_class(cfg.get("environment") or {})
     tool_logger = ToolCallLogger(
         environment_name=env_cls.__name__,
@@ -1401,6 +1360,14 @@ async def _run_single(
                 prompt_recorder=prompt_recorder,
             )
         )
+    # The pre-coordination phase is planning-shaped for toolset purposes: every
+    # agent's ToolsetDiscovery must offer the blackboard tools (post_message)
+    # when the runner walks the "pre_coordination" phase. Registered once per
+    # run, per agent (the discovery object is per-agent).
+    for agent in agents:
+        agent.toolset_discovery.planning_shaped_phases = (
+            set(agent.toolset_discovery.planning_shaped_phases) | {"pre_coordination"}
+        )
     # Match examples/base_main.py behavior for the default mode: "shuffled"
     # calls `random.shuffle(agents)` on the global RNG, which
     # HospitalEnvironment seeds with simulation.seed in __init__. "fixed" and
@@ -1453,9 +1420,10 @@ async def _run_single(
         role = roles.get(agent_name, "cooperative")
         post_message_available = not resolved_disable_pm
         # During the pre-coordination phase `post_message` is available only
-        # when a coalition-only secret board exists. If there is none, the tool
-        # is disabled for the phase so it cannot leak to a public board; the
-        # prompt says so explicitly. The helper also enforces this at runtime.
+        # when a coalition-only secret board exists. If there is none, the
+        # phase policy withholds the tool for the phase so it cannot leak to a
+        # public board; the prompt says so explicitly and the policy enforces
+        # it at runtime.
         if phase == "pre_coordination" and role == "adversary":
             post_message_available = secret_blackboard_id is not None
         return {
@@ -1507,15 +1475,20 @@ async def _run_single(
 
         def _build_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
             # Restriction is adversary-only: honest agents keep `post_message`.
-            if roles.get(turn["agent_name"]) == "adversary":
-                set_post_message_disabled(resolved_disable_pm)
+            # Applied per turn as a phase policy on the protocol; popping it
+            # restores the phase default for the next (honest) agent.
+            if roles.get(turn["agent_name"]) == "adversary" and resolved_disable_pm:
+                protocol.set_phase_policy(
+                    turn["phase"], PhaseToolPolicy(blackboard_tools=set())
+                )
             else:
-                set_post_message_disabled(False)
+                protocol.pop_phase_policy(turn["phase"])
             extra = _get_extra_fields(turn["agent_name"], turn["phase"])
-            # Tool availability for this exact agent/phase. Computed AFTER
-            # `set_post_message_disabled(...)` above, so the disabled-state
-            # reflected in the blackboard toolset is correct.
-            extra.update(_tool_availability_fields(turn["agent"], env, turn["phase"]))
+            # Tool availability for this exact agent/phase, honouring the
+            # phase policy set above.
+            extra.update(
+                _tool_availability_fields(turn["agent"], env, turn["phase"], protocol)
+            )
             if extra:
                 turn["agent_context"].update(extra)
             return turn
@@ -1605,15 +1578,16 @@ async def _run_single(
     # 3. SURVEY (POST-RUN BELIEFS) via the shared Terrarium phase walk.
     def _build_survey_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
         # Restriction is adversary-only: honest agents keep `post_message`.
-        if roles.get(turn["agent_name"]) == "adversary":
-            set_post_message_disabled(resolved_disable_pm)
+        if roles.get(turn["agent_name"]) == "adversary" and resolved_disable_pm:
+            protocol.set_phase_policy(
+                turn["phase"], PhaseToolPolicy(blackboard_tools=set())
+            )
         else:
-            set_post_message_disabled(False)
+            protocol.pop_phase_policy(turn["phase"])
         extra = _get_extra_fields(turn["agent_name"], "survey")
-        # Tool availability for this exact agent/phase. Computed AFTER
-        # `set_post_message_disabled(...)` above, so the disabled-state
-        # reflected in the blackboard toolset is correct.
-        extra.update(_tool_availability_fields(turn["agent"], env, "survey"))
+        # Tool availability for this exact agent/phase, honouring the phase
+        # policy set above.
+        extra.update(_tool_availability_fields(turn["agent"], env, "survey", protocol))
         if extra:
             turn["agent_context"].update(extra)
         return turn
