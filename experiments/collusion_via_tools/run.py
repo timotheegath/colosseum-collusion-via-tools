@@ -1189,38 +1189,6 @@ async def _run_single(
 ) -> Dict[str, Any]:
     rng = random.Random(int(seed))
 
-    def _should_stop_early(environment: Any) -> bool:
-        """
-        Early-stop criterion for Hospital-style environments.
-
-        Unlike HospitalEnvironment.done(), treat any recorded resource failure as
-        non-convergence (i.e., do not early-stop just because all steps are scheduled).
-        Falls back to environment.done(...) when the expected fields are unavailable.
-        """
-        try:
-            patients = getattr(environment, "patients", None)
-            patient_states = getattr(environment, "patient_states", None)
-            if not isinstance(patients, dict) or not isinstance(patient_states, dict):
-                return bool(environment.done(0))  # type: ignore[arg-type]
-
-            # Converged only if every patient has all steps scheduled AND no resource failures were recorded.
-            for pid, patient in patients.items():
-                state = patient_states.get(pid, {})
-                scheduled = state.get("scheduled_steps") or {}
-                pathway = patient.get("pathway") or []
-                if len(scheduled) != len(pathway):
-                    return False
-                failures = state.get("resource_failures") or []
-                if failures:
-                    return False
-            return True
-        except Exception:
-            # Conservative fallback: use the environment's own criterion.
-            try:
-                return bool(environment.done(0))  # type: ignore[arg-type]
-            except Exception:
-                return False
-
     # --- CONFIGURATION SETUP ---
     cfg = copy.deepcopy(base_cfg)
     cfg.setdefault("simulation", {})["seed"] = int(seed)
@@ -1540,7 +1508,7 @@ async def _run_single(
     current_iteration = 0
     for iteration in range(1, max_iterations + 1):
         current_iteration = iteration
-        if _should_stop_early(env):
+        if env.done(iteration):
             logger.info(
                 "Environment requested simulation stop at iteration %s", iteration
             )
