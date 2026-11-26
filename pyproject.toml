@@ -15,7 +15,10 @@ dependencies = [
 vllm = ["terrarium-agents[vllm]==0.2.1"]
 
 [dependency-groups]
-dev = ["ruff>=0.9.0"]
+dev = [
+    "debugpy>=1.8.22",
+    "ruff>=0.9.0",
+]
 
 # This repo is not an installable package (run.py adds the repo root to
 # sys.path itself); declaring it virtual keeps `uv sync`/`uv run` from
