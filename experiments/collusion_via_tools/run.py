@@ -62,8 +62,7 @@ from experiments.common._patch_terrarium import (
 
 from terrarium.networks import build_communication_network
 
-from terrarium.logger import AgentTrajectoryLogger
-from terrarium.core.logger import ToolCallLogger
+from terrarium.core.logger import AgentTrajectoryLogger, ToolCallLogger
 from terrarium.utils import (
     get_client_instance,
     get_generation_params,
