@@ -14,7 +14,7 @@ import asyncio
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
@@ -67,6 +67,7 @@ from terrarium.utils import (
     get_generation_params,
     get_model_name,
     build_vllm_runtime,
+    run_phase_entries,
 )
 
 LOGGER_NAME = "experiments.collusion_via_tools"
@@ -953,12 +954,6 @@ def _log_blackboards_txt(
         )
 
 
-def _augment_context(base: Dict[str, Any], *, extra: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    out.update(extra)
-    return out
-
-
 def _tool_availability_fields(agent: Any, env: Any, phase: str) -> Dict[str, Any]:
     """Context fields describing which tools ``agent`` can call in ``phase``.
 
@@ -1057,106 +1052,98 @@ async def _run_pre_coordination_rounds(
     # so a public post is impossible even if the tool were somehow offered.
     round_post_message_limit = max_messages if phase_post_message_available else 0
     try:
-        for pre_round in range(1, num_rounds + 1):
-            # Per-round cap: reset counters so each round gets its own budget.
-            set_post_message_call_limit(round_post_message_limit)
-            reset_post_message_counts()
+        adversary_agents = [a for a in env.agents if roles.get(a.name) == "adversary"]
+        started_rounds: set = set()
+        turns_per_round: Dict[int, int] = {}
 
-            last_agent: Optional[str] = None
-            for agent in env.agents:
-                if roles.get(agent.name) != "adversary":
-                    continue
+        def _build_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
+            if turn["round"] not in started_rounds:
+                started_rounds.add(turn["round"])
+                # Per-round cap: reset counters so each round gets its own budget.
+                set_post_message_call_limit(round_post_message_limit)
+                reset_post_message_counts()
+            extra = dict(extra_fields(turn["agent_name"], "pre_coordination"))
+            # Controlled phase metadata: never trust the environment to
+            # echo kwargs back. Without this injection the prompt and the
+            # agent see stale/default round metadata.
+            extra["post_message_available"] = phase_post_message_available
+            extra["pre_coordination_round"] = turn["round"]
+            extra["pre_coordination_rounds"] = num_rounds
+            # Tool availability for this exact agent/phase. Computed AFTER
+            # `set_post_message_disabled(...)` above, so the disabled-state
+            # reflected in the blackboard toolset is correct.
+            extra.update(_tool_availability_fields(turn["agent"], env, "pre_coordination"))
+            # Minimal context: identity + coalition strategy only, no
+            # environment state. Blocking tool calls is not sufficient
+            # because `env.build_agent_context` hands the adversary the
+            # full state (inventory, failures, job queue, costs) passively
+            # in the prompt.
+            turn["agent_context"] = _pre_coordination_context(
+                turn["agent_context"], extra=extra
+            )
+            return turn
 
-                full_ctx = env.build_agent_context(
-                    agent.name,
-                    phase="pre_coordination",
-                    iteration=0,
-                    pre_coordination_round=pre_round,
-                    pre_coordination_rounds=num_rounds,
+        def _on_turn(turn: Dict[str, Any]) -> None:
+            result = turn["result"]
+            entry: Dict[str, Any] = {
+                "phase": "pre_coordination",
+                "iteration": 0,
+                "round": turn["round"],
+                "pre_coordination_round": turn["round"],
+                "pre_coordination_rounds": num_rounds,
+                "agent": turn["agent_name"],
+                "role": roles[turn["agent_name"]],
+            }
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Pre-coordination planning turn failed for %s (round %s): %s",
+                    turn["agent_name"],
+                    turn["round"],
+                    _error_response(result),
                 )
-                extra = dict(extra_fields(agent.name, "pre_coordination"))
-                # Controlled phase metadata: never trust the environment to
-                # echo kwargs back. Without this injection the prompt and the
-                # agent see stale/default round metadata.
-                extra["post_message_available"] = phase_post_message_available
-                extra["pre_coordination_round"] = pre_round
-                extra["pre_coordination_rounds"] = num_rounds
-                # Tool availability for this exact agent/phase. Computed AFTER
-                # `set_post_message_disabled(...)` above, so the disabled-state
-                # reflected in the blackboard toolset is correct.
-                extra.update(_tool_availability_fields(agent, env, "pre_coordination"))
-                # Minimal context: identity + coalition strategy only, no
-                # environment state. Blocking tool calls is not sufficient
-                # because `env.build_agent_context` hands the adversary the
-                # full state (inventory, failures, job queue, costs) passively
-                # in the prompt.
-                agent_context = _pre_coordination_context(full_ctx, extra=extra)
-                try:
-                    response = await protocol.agent_planning_turn(
-                        agent,
-                        agent.name,
-                        agent_context,
-                        env,
-                        iteration=0,
-                        planning_round=pre_round,
-                        phase="pre_coordination",
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Pre-coordination planning turn failed for %s (round %s): %s",
-                        agent.name,
-                        pre_round,
-                        _error_response(exc),
-                    )
-                    turns.append(
-                        {
-                            "phase": "pre_coordination",
-                            "iteration": 0,
-                            "round": pre_round,
-                            "pre_coordination_round": pre_round,
-                            "pre_coordination_rounds": num_rounds,
-                            "agent": agent.name,
-                            "role": roles[agent.name],
-                            "response": _error_response(exc),
-                            "usage": None,
-                            "tools_executed": [],
-                        }
-                    )
-                    if on_turn is not None:
-                        on_turn(turns)
-                    last_agent = agent.name
-                    continue
-                turns.append(
+                entry.update(
                     {
-                        "phase": "pre_coordination",
-                        "iteration": 0,
-                        "round": pre_round,
-                        "pre_coordination_round": pre_round,
-                        "pre_coordination_rounds": num_rounds,
-                        "agent": agent.name,
-                        "role": roles[agent.name],
-                        "response": response.get("response"),
-                        "usage": response.get("usage"),
-                        "tools_executed": response.get("tools_executed"),
-                        **_extract_initial_prompts(response),
+                        "response": _error_response(result),
+                        "usage": None,
+                        "tools_executed": [],
                     }
                 )
-                if on_turn is not None:
-                    on_turn(turns)
-                last_agent = agent.name
-
-            if last_agent and bb_logger is not None:
+            else:
+                entry.update(
+                    {
+                        "response": result.get("response"),
+                        "usage": result.get("usage"),
+                        "tools_executed": result.get("tools_executed"),
+                        **_extract_initial_prompts(result),
+                    }
+                )
+            turns.append(entry)
+            if on_turn is not None:
+                on_turn(turns)
+            turns_per_round[turn["round"]] = turns_per_round.get(turn["round"], 0) + 1
+            if turns_per_round[turn["round"]] == len(adversary_agents) and bb_logger is not None:
                 try:
                     _log_blackboards_txt(
                         bb_logger=bb_logger,
                         protocol=protocol,
                         iteration=0,
                         phase="pre_coordination",
-                        agent_name=last_agent,
-                        planning_round=pre_round,
+                        agent_name=turn["agent_name"],
+                        planning_round=turn["round"],
                     )
                 except Exception:
                     pass
+
+        await run_phase_entries(
+            [{"phase": "pre_coordination", "rounds": num_rounds}],
+            environment=env,
+            communication_protocol=protocol,
+            iteration=0,
+            agents=adversary_agents,
+            build_turn=_build_turn,
+            on_turn=_on_turn,
+            progress=False,
+        )
     finally:
         # Restore the state that existed before the phase, even on failure.
         set_env_tools_blocked(prior_env_tools_blocked)
@@ -1514,221 +1501,166 @@ async def _run_single(
             break
 
         # 1. PLANNING
-        for planning_round in range(1, planning_rounds + 1):
-            round_level_disabled = resolved_disable_pm
-            last_agent = None
-            for agent in env.agents:
-                # Restriction is adversary-only: honest agents keep `post_message`.
-                if roles.get(agent.name) == "adversary":
-                    set_post_message_disabled(round_level_disabled)
-                else:
-                    set_post_message_disabled(False)
-                base_ctx = env.build_agent_context(
-                    agent.name,
-                    phase="planning",
-                    iteration=iteration,
-                    planning_round=planning_round,
-                )
-                extra = _get_extra_fields(agent.name, "planning")
-                # Tool availability for this exact agent/phase. Computed AFTER
-                # `set_post_message_disabled(...)` above, so the disabled-state
-                # reflected in the blackboard toolset is correct.
-                extra.update(_tool_availability_fields(agent, env, "planning"))
-                agent_context = (
-                    base_ctx if not extra else _augment_context(base_ctx, extra=extra)
-                )
+        # 1. PLANNING + 2. EXECUTION via the shared Terrarium phase walk.
+        walk_agents = list(env.agents)
+        turns_per_round: Dict[Tuple[str, int], int] = {}
 
-                try:
-                    response = await protocol.agent_planning_turn(
-                        agent,
-                        agent.name,
-                        agent_context,
-                        env,
-                        iteration=iteration,
-                        planning_round=planning_round,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Planning turn failed for %s (iteration %s, round %s): %s",
-                        agent.name,
-                        iteration,
-                        planning_round,
-                        _error_response(exc),
-                    )
-                    turns.append(
-                        {
-                            "phase": "planning",
-                            "iteration": iteration,
-                            "round": planning_round,
-                            "agent": agent.name,
-                            "role": roles[agent.name],
-                            "response": _error_response(exc),
-                            "usage": None,
-                            "tools_executed": [],
-                        }
-                    )
-                    atomic_write_json(run_dir / "agent_turns.json", turns)
-                    last_agent = agent.name
-                    continue
-                turns.append(
-                    {
-                        "phase": "planning",
-                        "iteration": iteration,
-                        "round": planning_round,
-                        "agent": agent.name,
-                        "role": roles[agent.name],
-                        "response": response.get("response"),
-                        "usage": response.get("usage"),
-                        "tools_executed": response.get("tools_executed"),
-                        **_extract_initial_prompts(response),
-                    }
-                )
-                atomic_write_json(run_dir / "agent_turns.json", turns)
-                last_agent = agent.name
-
-            if last_agent:
-                _log_blackboards_txt(
-                    bb_logger=bb_logger,
-                    protocol=protocol,
-                    iteration=iteration,
-                    phase="planning",
-                    agent_name=last_agent,
-                    planning_round=planning_round,
-                )
-
-        # 2. EXECUTION
-        last_exec_agent = None
-        for agent in env.agents:
+        def _build_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
             # Restriction is adversary-only: honest agents keep `post_message`.
-            if roles.get(agent.name) == "adversary":
+            if roles.get(turn["agent_name"]) == "adversary":
                 set_post_message_disabled(resolved_disable_pm)
             else:
                 set_post_message_disabled(False)
-            base_ctx = env.build_agent_context(
-                agent.name, phase="execution", iteration=iteration
-            )
-            extra = _get_extra_fields(agent.name, "execution")
+            extra = _get_extra_fields(turn["agent_name"], turn["phase"])
             # Tool availability for this exact agent/phase. Computed AFTER
             # `set_post_message_disabled(...)` above, so the disabled-state
             # reflected in the blackboard toolset is correct.
-            extra.update(_tool_availability_fields(agent, env, "execution"))
-            agent_context = (
-                base_ctx if not extra else _augment_context(base_ctx, extra=extra)
-            )
+            extra.update(_tool_availability_fields(turn["agent"], env, turn["phase"]))
+            if extra:
+                turn["agent_context"].update(extra)
+            return turn
 
-            try:
-                response = await protocol.agent_execution_turn(
-                    agent, agent.name, agent_context, env, iteration=iteration
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Execution turn failed for %s (iteration %s): %s",
-                    agent.name,
-                    iteration,
-                    _error_response(exc),
-                )
-                turns.append(
+        def _on_turn(turn: Dict[str, Any]) -> None:
+            result = turn["result"]
+            entry: Dict[str, Any] = {"phase": turn["phase"], "iteration": iteration}
+            if turn["phase"] == "planning":
+                entry["round"] = turn["round"]
+            entry["agent"] = turn["agent_name"]
+            entry["role"] = roles[turn["agent_name"]]
+            if isinstance(result, BaseException):
+                if turn["phase"] == "planning":
+                    logger.warning(
+                        "Planning turn failed for %s (iteration %s, round %s): %s",
+                        turn["agent_name"],
+                        iteration,
+                        turn["round"],
+                        _error_response(result),
+                    )
+                else:
+                    logger.warning(
+                        "Execution turn failed for %s (iteration %s): %s",
+                        turn["agent_name"],
+                        iteration,
+                        _error_response(result),
+                    )
+                entry.update(
                     {
-                        "phase": "execution",
-                        "iteration": iteration,
-                        "agent": agent.name,
-                        "role": roles[agent.name],
-                        "response": _error_response(exc),
+                        "response": _error_response(result),
                         "usage": None,
                         "tools_executed": [],
                     }
                 )
-                atomic_write_json(run_dir / "agent_turns.json", turns)
-                last_exec_agent = agent.name
-                continue
-            turns.append(
-                {
-                    "phase": "execution",
-                    "iteration": iteration,
-                    "agent": agent.name,
-                    "role": roles[agent.name],
-                    "response": response.get("response"),
-                    "usage": response.get("usage"),
-                    "tools_executed": response.get("tools_executed"),
-                    **_extract_initial_prompts(response),
-                }
-            )
+            else:
+                entry.update(
+                    {
+                        "response": result.get("response"),
+                        "usage": result.get("usage"),
+                        "tools_executed": result.get("tools_executed"),
+                        **_extract_initial_prompts(result),
+                    }
+                )
+            turns.append(entry)
             atomic_write_json(run_dir / "agent_turns.json", turns)
-            last_exec_agent = agent.name
+            key = (turn["phase"], turn["round"])
+            turns_per_round[key] = turns_per_round.get(key, 0) + 1
+            if turn["phase"] in ("planning", "execution") and turns_per_round[
+                key
+            ] == len(walk_agents):
+                if turn["phase"] == "planning":
+                    _log_blackboards_txt(
+                        bb_logger=bb_logger,
+                        protocol=protocol,
+                        iteration=iteration,
+                        phase="planning",
+                        agent_name=turn["agent_name"],
+                        planning_round=turn["round"],
+                    )
+                else:
+                    _log_blackboards_txt(
+                        bb_logger=bb_logger,
+                        protocol=protocol,
+                        iteration=iteration,
+                        phase="execution",
+                        agent_name=turn["agent_name"],
+                    )
 
-        if last_exec_agent:
-            _log_blackboards_txt(
-                bb_logger=bb_logger,
-                protocol=protocol,
-                iteration=iteration,
-                phase="execution",
-                agent_name=last_exec_agent,
-            )
+        await run_phase_entries(
+            [
+                {"phase": "planning", "rounds": planning_rounds},
+                {"phase": "execution", "rounds": 1},
+            ],
+            environment=env,
+            communication_protocol=protocol,
+            iteration=iteration,
+            build_turn=_build_turn,
+            on_turn=_on_turn,
+            progress=False,
+        )
 
         try:
             env.log_iteration_summary(iteration)
         except Exception:
             pass
 
-    # 3. SURVEY (POST-RUN BELIEFS)
-    for agent in env.agents:
+    # 3. SURVEY (POST-RUN BELIEFS) via the shared Terrarium phase walk.
+    def _build_survey_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
         # Restriction is adversary-only: honest agents keep `post_message`.
-        if roles.get(agent.name) == "adversary":
+        if roles.get(turn["agent_name"]) == "adversary":
             set_post_message_disabled(resolved_disable_pm)
         else:
             set_post_message_disabled(False)
-        base_ctx = env.build_agent_context(
-            agent.name, phase="survey", iteration=max(1, current_iteration)
-        )
-        extra = _get_extra_fields(agent.name, "survey")
+        extra = _get_extra_fields(turn["agent_name"], "survey")
         # Tool availability for this exact agent/phase. Computed AFTER
         # `set_post_message_disabled(...)` above, so the disabled-state
         # reflected in the blackboard toolset is correct.
-        extra.update(_tool_availability_fields(agent, env, "survey"))
-        agent_context = (
-            base_ctx if not extra else _augment_context(base_ctx, extra=extra)
-        )
-        try:
-            response = await protocol.agent_survey_turn(
-                agent,
-                agent.name,
-                agent_context,
-                env,
-                iteration=max(1, current_iteration),
-            )
-        except Exception as exc:
+        extra.update(_tool_availability_fields(turn["agent"], env, "survey"))
+        if extra:
+            turn["agent_context"].update(extra)
+        return turn
+
+    def _on_survey_turn(turn: Dict[str, Any]) -> None:
+        result = turn["result"]
+        entry: Dict[str, Any] = {
+            "phase": "survey",
+            "iteration": current_iteration,
+            "agent": turn["agent_name"],
+            "role": roles[turn["agent_name"]],
+        }
+        if isinstance(result, BaseException):
             logger.warning(
                 "Survey turn failed for %s (iteration %s): %s",
-                agent.name,
+                turn["agent_name"],
                 max(1, current_iteration),
-                _error_response(exc),
+                _error_response(result),
             )
-            turns.append(
+            entry.update(
                 {
-                    "phase": "survey",
-                    "iteration": current_iteration,
-                    "agent": agent.name,
-                    "role": roles[agent.name],
-                    "response": _error_response(exc),
+                    "response": _error_response(result),
                     "usage": None,
                     "tools_executed": [],
                 }
             )
-            atomic_write_json(run_dir / "agent_turns.json", turns)
-            continue
-        turns.append(
-            {
-                "phase": "survey",
-                "iteration": current_iteration,
-                "agent": agent.name,
-                "role": roles[agent.name],
-                "response": response.get("response"),
-                "usage": response.get("usage"),
-                "tools_executed": response.get("tools_executed"),
-                **_extract_initial_prompts(response),
-            }
-        )
+        else:
+            entry.update(
+                {
+                    "response": result.get("response"),
+                    "usage": result.get("usage"),
+                    "tools_executed": result.get("tools_executed"),
+                    **_extract_initial_prompts(result),
+                }
+            )
+        turns.append(entry)
         atomic_write_json(run_dir / "agent_turns.json", turns)
+
+    await run_phase_entries(
+        [{"phase": "survey", "rounds": 1}],
+        environment=env,
+        communication_protocol=protocol,
+        iteration=max(1, current_iteration),
+        build_turn=_build_survey_turn,
+        on_turn=_on_survey_turn,
+        progress=False,
+    )
 
     # Persist turns before the judge pass (judge_beliefs loads agent_turns.json).
     atomic_write_json(run_dir / "agent_turns.json", turns)
