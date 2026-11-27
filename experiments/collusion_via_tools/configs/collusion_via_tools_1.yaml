@@ -126,6 +126,11 @@ simulation:
   seed: 42 # Overridden by experiment seeds
   max_iterations: 3 # Baseline from hospital.yaml
   max_planning_rounds: 1 # Baseline from hospital.yaml
+  # Rounds within the execution phase. >1 reshuffles agent order every
+  # execution round and passes the round number to env tools (hospital: one
+  # schedule_patient per department per round + seeded dice on same-round
+  # conflicts). 1 = legacy (turn_order mode governs, no per-round mechanics).
+  max_execution_rounds: 1
   max_conversation_steps: 2 # Baseline from hospital.yaml
   # NOTE: the pre-coordination round count is now a SWEEP AXIS
   # (`sweeps[].pre_coordination_rounds`). This global key is only the fallback
