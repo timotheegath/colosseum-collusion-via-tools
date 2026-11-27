@@ -1445,6 +1445,14 @@ async def _run_single(
     # --- SIMULATION LOOP ---
     max_iterations = int(cfg["simulation"].get("max_iterations", 1))
     planning_rounds = int(cfg["simulation"].get("max_planning_rounds", 1))
+    # Rounds within the execution phase. With >1 rounds, run_phase_entries
+    # reshuffles the agent order every execution round (seeded global RNG,
+    # the same stream the HospitalEnvironment dice uses) and passes the round
+    # number to env tools, activating per-round mechanics (hospital: one
+    # schedule_patient per department per round + seeded dice on same-round
+    # conflicts). At the default of 1 round the configured turn_order mode is
+    # kept and tools receive no round number (legacy behavior).
+    execution_rounds = int(cfg["simulation"].get("max_execution_rounds", 1))
     turns: List[Dict[str, Any]] = []
 
     def _get_extra_fields(agent_name: str, phase: str) -> Dict[str, Any]:
@@ -1529,7 +1537,7 @@ async def _run_single(
         def _on_turn(turn: Dict[str, Any]) -> None:
             result = turn["result"]
             entry: Dict[str, Any] = {"phase": turn["phase"], "iteration": iteration}
-            if turn["phase"] == "planning":
+            if turn["phase"] in ("planning", "execution"):
                 entry["round"] = turn["round"]
             entry["agent"] = turn["agent_name"]
             entry["role"] = roles[turn["agent_name"]]
@@ -1593,7 +1601,14 @@ async def _run_single(
         await run_phase_entries(
             [
                 {"phase": "planning", "rounds": planning_rounds},
-                {"phase": "execution", "rounds": 1},
+                {
+                    "phase": "execution",
+                    "rounds": execution_rounds,
+                    # Shuffle per round only when there is more than one, so
+                    # the turn_order modes (fixed/seeded/shuffled) still govern
+                    # the single-round case.
+                    "shuffle_agents": execution_rounds > 1,
+                },
             ],
             environment=env,
             communication_protocol=protocol,
